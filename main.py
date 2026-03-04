@@ -3,6 +3,28 @@ import time
 from ultralytics import YOLO
 import torch
 
+CLASS_MAPPING = {
+
+    "couch": {
+        "business_name": "sofa",
+        "density_group": "upholstered",
+        "fragile": False
+    },
+
+    "chair": {
+        "business_name": "chair",
+        "density_group": "wood_light",
+        "fragile": False
+    },
+
+    "dining table": {
+        "business_name": "table",
+        "density_group": "wood_heavy",
+        "fragile": False
+    }
+
+}
+
 def main():
     cap = cv.VideoCapture(0)
     model = YOLO("yolov8n.pt")
@@ -17,7 +39,6 @@ def main():
     fps_start_time = time.perf_counter()
 
     CONF_THRESHOLD = 0.3
-    ALLOWED_CLASSES = {"chair", "couch", "dining table"}
 
     while True:
         ret, frame = cap.read()
@@ -50,22 +71,32 @@ def main():
         classes = result.boxes.cls.cpu().numpy()
         confs = result.boxes.conf.cpu().numpy()
 
+        detections=[]
+
         for box, cls, conf in zip(boxes, classes, confs):
             x1, y1, x2, y2 = map(int,box)
             class_id = int(cls)
             class_name = model.names[int(class_id)]
-            if class_name not in ALLOWED_CLASSES:
-                continue
             if conf < CONF_THRESHOLD:
                 continue
-            if class_name == "couch":
-                business_label = "sofa"
-            elif class_name == "dining table":
-                business_label = "table"
-            else:
-                business_label=class_name
+            if class_name not in CLASS_MAPPING:
+                continue
+            metadata = CLASS_MAPPING[class_name]
+            business_label = metadata["business_name"]
             label = f"{business_label.capitalize()} {conf*100:.2f}%"
             text_position = (x1, max(y1 - 10, 0))
+
+            item={
+                "class_name":class_name,
+                "business_label":business_label.capitalize(),
+                "confidence":conf,
+                "density_group":metadata["density_group"],
+                "fragile":metadata["fragile"],
+                "bounding_box":[x1,y1,x2,y2]
+            }
+
+            detections.append(item)
+
             cv.rectangle(
                 frame,
                 (x1, y1),
