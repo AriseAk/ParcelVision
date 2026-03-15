@@ -1,14 +1,12 @@
 """
 depth_server.py  –  ParcelVision Stage 5-12 backend
 ====================================================
-Exposes two endpoints:
-  POST /depth   →  { "points": [[u,v], ...] }
-                ←  { "depths": [z, ...] }   (meters)
-
-  POST /measure →  { "frame_b64": "...", "objects": [...] }
-                ←  { "objects": [ { object_id, label,
-                                    length, width, height,
-                                    volume_m3, confidence } ] }
+Exposes:
+  GET  /health
+  POST /depth    { "frame_b64": "...", "points": [[u,v],...] }
+              →  { "depths": [z,...] }
+  POST /measure  { "frame_b64": "...", "objects": [...] }
+              →  { "objects": [...], "inference_ms": float }
 
 Run:  python depth_server.py
 """
@@ -16,327 +14,320 @@ Run:  python depth_server.py
 from __future__ import annotations
 
 import base64
+import sys
 import time
 import traceback
 from typing import Any
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-import cv2
 from flask import Flask, jsonify, request
-from PIL import Image
-import sys
-sys.path.append("./Depth-Anything-V2")
-# ── DepthAnything v2 (small, CPU-safe) ──────────────────────────────────────
-try:
-    from depth_anything_v2.dpt import DepthAnythingV2   # pip install depth-anything-v2
-    _USE_DA2 = True
-except ImportError:
-    _USE_DA2 = False
-    print("[depth_server] DepthAnything v2 not found – falling back to MiDaS.")
 
-# ── MiDaS fallback ───────────────────────────────────────────────────────────
+# ── DepthAnything V2 ──────────────────────────────────────────────────────────
+sys.path.insert(0, "./Depth-Anything-V2")   # local clone takes priority
 try:
-    import timm   # noqa: F401
+    from depth_anything_v2.dpt import DepthAnythingV2
+    _USE_DA2 = True
+    print("[depth_server] DepthAnything V2 import OK")
+except ImportError as _e:
+    _USE_DA2 = False
+    print(f"[depth_server] DepthAnything V2 not found ({_e}) – will try MiDaS")
+
+# ── MiDaS fallback ────────────────────────────────────────────────────────────
+try:
+    import timm  # noqa: F401
     _HAS_TIMM = True
 except ImportError:
     _HAS_TIMM = False
 
-# ── Flask app ────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Camera intrinsics  (edit to match your camera / calibration)
+# Camera intrinsics — tune these to your camera
 # ─────────────────────────────────────────────────────────────────────────────
-CAMERA_FX   = 525.0   # focal length  x  (pixels)
-CAMERA_FY   = 525.0   # focal length  y  (pixels)
+CAMERA_FX   = 525.0   # focal length x (pixels)
+CAMERA_FY   = 525.0   # focal length y (pixels)
 CAMERA_CX   = 320.0   # principal point x
 CAMERA_CY   = 240.0   # principal point y
-DEPTH_SCALE = 4.0     # metric scale for relative-depth models (tune per scene)
+DEPTH_SCALE = 4.0     # relative-to-metric scale factor (tune per scene)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Depth model loader
+# Model state
 # ─────────────────────────────────────────────────────────────────────────────
-_depth_model  = None
+_depth_model     = None
 _depth_transform = None
-_device = "cuda" if torch.cuda.is_available() else "cpu"
+_device          = "cuda" if torch.cuda.is_available() else "cpu"
 _model_type: str = "none"
-_last_depth_map: np.ndarray | None = None   # cache for legacy /depth calls
+_last_depth_map: np.ndarray | None = None
 
 
-def _load_depth_model():
+def _load_depth_model() -> None:
     global _depth_model, _depth_transform, _model_type
 
     if _depth_model is not None:
         return
 
-    # ── Try DepthAnything v2 ───────────────────────────────────────────────
+    # ── DepthAnything V2 ─────────────────────────────────────────────────────
     if _USE_DA2:
         try:
             cfg = {
-                "encoder": "vits",
-                "features": 64,
+                "encoder":      "vits",
+                "features":     64,
                 "out_channels": [48, 96, 192, 384],
             }
-
             model = DepthAnythingV2(**cfg)
-
-            # Correct way to load checkpoint
-            state_dict = torch.load(
+            state = torch.load(
                 "depth_anything_v2_vits.pth",
-                map_location=_device
+                map_location=_device,
+                weights_only=True,
             )
-
-            model.load_state_dict(state_dict)
-
-            model.to(_device)
-            model.eval()
-
+            model.load_state_dict(state)
+            model.to(_device).eval()
             _depth_model = model
-            _model_type = "da2"
-
-            print(f"[depth_server] DepthAnything v2 (vits) loaded on {_device}")
+            _model_type  = "da2"
+            print(f"[depth_server] DA2 vits loaded on {_device}")
             return
+        except Exception:
+            print("[depth_server] DA2 load failed:")
+            traceback.print_exc()
+            print("[depth_server] Falling back to MiDaS")
 
-        except Exception as e:
-            print(f"[depth_server] DA2 load failed: {e} – trying MiDaS")
-
-    # ── Try MiDaS fallback ─────────────────────────────────────────────────
+    # ── MiDaS ────────────────────────────────────────────────────────────────
     if _HAS_TIMM:
         try:
             midas = torch.hub.load(
-                "intel-isl/MiDaS",
-                "MiDaS_small",
-                trust_repo=True
+                "intel-isl/MiDaS", "MiDaS_small", trust_repo=True
             )
-
             midas.to(_device).eval()
-
             transforms = torch.hub.load(
-                "intel-isl/MiDaS",
-                "transforms",
-                trust_repo=True
+                "intel-isl/MiDaS", "transforms", trust_repo=True
             )
-
-            _depth_model = midas
+            _depth_model     = midas
             _depth_transform = transforms.small_transform
-            _model_type = "midas"
-
+            _model_type      = "midas"
             print(f"[depth_server] MiDaS_small loaded on {_device}")
             return
+        except Exception:
+            print("[depth_server] MiDaS load failed:")
+            traceback.print_exc()
 
-        except Exception as e:
-            print(f"[depth_server] MiDaS load failed: {e} – using dummy depth")
-
-    # ── Dummy fallback ─────────────────────────────────────────────────────
+    # ── Dummy (linear gradient, offline testing only) ─────────────────────────
     _model_type = "dummy"
-    print("[depth_server] WARNING: using dummy depth model (gradient plane).")
+    print("[depth_server] WARNING: using dummy depth model")
 
 
-def _infer_depth(bgr_frame: np.ndarray) -> np.ndarray:
-    """Return a float32 depth map in *meters*, same H×W as input."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Depth inference
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _infer_depth(bgr: np.ndarray) -> np.ndarray:
+    """Return float32 depth map in metres, H x W, same spatial size as input."""
     _load_depth_model()
-    h, w = bgr_frame.shape[:2]
+    h, w = bgr.shape[:2]
 
     if _model_type == "da2":
-        rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb)
+        # DA2's infer_image() expects a BGR numpy array (H, W, 3).
+        # Do NOT convert to PIL or RGB — the method handles that internally.
         with torch.no_grad():
-            depth = _depth_model.infer_image(pil)          # relative depth H×W
-        depth = np.array(depth, dtype=np.float32)
-        # Normalise to [0,1] then scale to metres
-        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-        depth = depth * DEPTH_SCALE
-        return depth
+            depth = _depth_model.infer_image(bgr)   # returns H x W float32 relative depth
+        depth = np.asarray(depth, dtype=np.float32)
+        d_min, d_max = float(depth.min()), float(depth.max())
+        depth = (depth - d_min) / (d_max - d_min + 1e-8)
+        return (depth * DEPTH_SCALE).astype(np.float32)
 
     if _model_type == "midas":
-        rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         inp = _depth_transform(rgb).to(_device)
         with torch.no_grad():
             pred = _depth_model(inp)
-            pred = F.interpolate(pred.unsqueeze(1), size=(h, w),
-                                 mode="bicubic", align_corners=False).squeeze()
+        pred  = F.interpolate(
+            pred.unsqueeze(1), size=(h, w),
+            mode="bicubic", align_corners=False
+        ).squeeze()
         depth = pred.cpu().numpy().astype(np.float32)
-        # MiDaS is *inverse* depth – invert and scale
+        # MiDaS outputs inverse-depth — flip before normalising
         depth = 1.0 / (depth + 1e-8)
-        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-        depth = depth * DEPTH_SCALE
-        return depth
+        d_min, d_max = float(depth.min()), float(depth.max())
+        depth = (depth - d_min) / (d_max - d_min + 1e-8)
+        return (depth * DEPTH_SCALE).astype(np.float32)
 
-    # dummy: linear gradient 0.5 m … 4.5 m
-    depth = np.linspace(0.5, 4.5, w, dtype=np.float32)
-    return np.tile(depth, (h, 1))
+    # Dummy: horizontal gradient 0.5 … 4.5 m
+    row = np.linspace(0.5, 4.5, w, dtype=np.float32)
+    return np.tile(row, (h, 1))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Geometry helpers (Stages 7-10)
+# Geometry — Stages 7-10
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _pixels_to_3d(us: np.ndarray, vs: np.ndarray, zs: np.ndarray) -> np.ndarray:
-    """Back-project pixel coordinates to 3-D camera space."""
     X = (us - CAMERA_CX) * zs / CAMERA_FX
     Y = (vs - CAMERA_CY) * zs / CAMERA_FY
     return np.stack([X, Y, zs], axis=-1)   # (N, 3)
 
 
 def _filter_point_cloud(pts: np.ndarray) -> np.ndarray:
-    """Statistical outlier removal + floor plane filtering.
+    """Statistical outlier removal + floor / depth-edge trim.
 
-    Coordinate conventions (camera space):
-      X = rightward,  Y = downward,  Z = depth (away from camera).
-    Floor removal trims the lowest 5 % of Y values.
-    This is correct when the camera is roughly horizontal — i.e. Y axis
-    points down in the scene.  If the camera is tilted significantly,
-    reconsider which axis to trim.
+    Camera-space: X right, Y down, Z into scene.
+    'Floor' = large Y values (bottom of image).
     """
     if len(pts) < 10:
         return pts
 
-    # ── Statistical outlier removal ──────────────────────────────────────────
-    centroid = pts.mean(axis=0)                       # (3,) centre of mass
-    dists    = np.linalg.norm(pts - centroid, axis=1) # distance of each pt from centre
-    sigma    = dists.std()
-    threshold = dists.mean() + 2.5 * sigma            # FIX: was mean.mean() (wrong axis)
+    # Outlier removal — threshold lives in distance space
+    centroid  = pts.mean(axis=0)
+    dists     = np.linalg.norm(pts - centroid, axis=1)
+    threshold = dists.mean() + 2.5 * dists.std()
     pts = pts[dists < threshold]
 
-    # ── Remove floor (lowest 5 % of Y values) ───────────────────────────────
+    # Floor: remove highest 5 % of Y (largest Y = lowest in scene)
     if len(pts) > 20:
-        y_thresh = np.percentile(pts[:, 1], 5)
-        pts = pts[pts[:, 1] > y_thresh]
+        pts = pts[pts[:, 1] < np.percentile(pts[:, 1], 95)]
 
-    # ── Edge trim: remove extreme 3 % in depth ───────────────────────────────
+    # Depth edge trim: remove 3 % tails
     if len(pts) > 20:
         z_lo = np.percentile(pts[:, 2], 3)
         z_hi = np.percentile(pts[:, 2], 97)
-        pts = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
+        pts  = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
 
     return pts
 
 
 def _fit_bounding_box(pts: np.ndarray) -> dict[str, float]:
-    """Axis-aligned bounding box → length / width / height in metres."""
     if len(pts) < 4:
         return {"length": 0.0, "width": 0.0, "height": 0.0, "volume_m3": 0.0}
 
-    x_min, x_max = pts[:, 0].min(), pts[:, 0].max()
-    y_min, y_max = pts[:, 1].min(), pts[:, 1].max()
-    z_min, z_max = pts[:, 2].min(), pts[:, 2].max()
-
-    length = float(x_max - x_min)   # horizontal span
-    height = float(y_max - y_min)   # vertical span
-    width  = float(z_max - z_min)   # depth span
-
-    # Clamp implausible values (sensor noise)
-    length = np.clip(length, 0.01, 10.0)
-    height = np.clip(height, 0.01, 10.0)
-    width  = np.clip(width,  0.01, 10.0)
-
-    volume = round(float(length * width * height), 4)
+    length = float(np.clip(pts[:, 0].max() - pts[:, 0].min(), 0.01, 10.0))
+    height = float(np.clip(pts[:, 1].max() - pts[:, 1].min(), 0.01, 10.0))
+    width  = float(np.clip(pts[:, 2].max() - pts[:, 2].min(), 0.01, 10.0))
     return {
-        "length": round(length, 3),
-        "width":  round(width,  3),
-        "height": round(height, 3),
-        "volume_m3": volume,
+        "length":    round(length, 3),
+        "width":     round(width,  3),
+        "height":    round(height, 3),
+        "volume_m3": round(length * width * height, 4),
     }
 
 
-def _depth_confidence(depth_vals: np.ndarray) -> float:
-    """Reliability score based on depth variance (low variance = high confidence)."""
-    if len(depth_vals) < 2:
+def _depth_confidence(zs: np.ndarray) -> float:
+    if len(zs) < 2:
         return 0.5
-    cv = depth_vals.std() / (depth_vals.mean() + 1e-8)
-    return float(np.clip(1.0 - cv, 0.0, 1.0))
+    return float(np.clip(1.0 - zs.std() / (zs.mean() + 1e-8), 0.0, 1.0))
 
 
-def _final_confidence(
-    detection_conf: float,
-    segmentation_score: float,
-    depth_rel: float,
-    tracking_stability: float,
-) -> float:
-    score = (
-        0.30 * detection_conf
-        + 0.30 * segmentation_score
-        + 0.20 * depth_rel
-        + 0.20 * tracking_stability
-    )
-    return round(float(np.clip(score, 0.0, 1.0)), 4)
+def _final_confidence(det: float, seg: float, depth_rel: float, track: float) -> float:
+    return round(float(np.clip(
+        0.30 * det + 0.30 * seg + 0.20 * depth_rel + 0.20 * track, 0.0, 1.0
+    )), 4)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 6: mask + depth fusion  →  full measurement pipeline for one object
+# Per-object pipeline — Stages 6-12
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _measure_object(
     depth_map: np.ndarray,
-    mask_np: np.ndarray,        # binary H×W  (0 or 1)
-    obj_meta: dict[str, Any],
-) -> dict[str, Any]:
-    """Fuse mask with depth, build point cloud, extract 3-D dimensions."""
+    mask_np:   np.ndarray,
+    meta:      dict[str, Any],
+) -> dict[str, Any] | None:
+
+    oid = meta.get("object_id", "?")
     h, w = depth_map.shape
 
-    # Resize mask to match depth map
     if mask_np.shape != (h, w):
         mask_np = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_NEAREST)
 
-    # Stage 6 – mask-depth fusion
-    binary = (mask_np > 0.5).astype(bool)
-    object_depth = depth_map * binary             # zero out background
-
-    # Pixel coordinates of object
-    vs, us = np.where(binary)
+    vs, us = np.where(mask_np > 0.5)
     if len(us) < 10:
+        print(f"[measure_object] id={oid} sparse mask ({len(us)} px) — skip")
         return None
-    zs = object_depth[vs, us]
 
-    # Remove zero-depth pixels (background bleed)
+    zs = depth_map[vs, us]
+
+    # Remove pixels where depth is effectively zero (mask bleed onto background)
     valid = zs > 0.05
     us, vs, zs = us[valid], vs[valid], zs[valid]
     if len(us) < 10:
+        print(f"[measure_object] id={oid} only {len(us)} px after depth filter — skip")
         return None
 
-    # Stage 7 – point cloud generation (sample up to 2000 pts for speed)
-    MAX_PTS = 2000
-    if len(us) > MAX_PTS:
-        idx = np.random.choice(len(us), MAX_PTS, replace=False)
+    # Random subsample for speed
+    if len(us) > 2000:
+        idx = np.random.choice(len(us), 2000, replace=False)
         us, vs, zs = us[idx], vs[idx], zs[idx]
-    pts = _pixels_to_3d(us.astype(float), vs.astype(float), zs)
 
-    # Stage 8 – point cloud filtering
+    pts = _pixels_to_3d(us.astype(float), vs.astype(float), zs)
     pts = _filter_point_cloud(pts)
     if len(pts) < 4:
+        print(f"[measure_object] id={oid} only {len(pts)} pts after filter — skip")
         return None
 
-    # Stage 9 & 10 – bounding box + dimensions
     dims = _fit_bounding_box(pts)
-
-    # Stage 11 – confidence
-    depth_rel   = _depth_confidence(zs)
-    tracking_st = obj_meta.get("mask_stability", 0.5)
     conf = _final_confidence(
-        detection_conf     = obj_meta.get("confidence", 0.5),
-        segmentation_score = obj_meta.get("segmentation_score", 0.5),
-        depth_rel          = depth_rel,
-        tracking_stability = tracking_st,
+        det       = meta.get("confidence",         0.5),
+        seg       = meta.get("segmentation_score", 0.5),
+        depth_rel = _depth_confidence(zs),
+        track     = meta.get("mask_stability",     0.5),
     )
 
+    print(f"[measure_object] id={oid} "
+          f"L={dims['length']:.2f} W={dims['width']:.2f} H={dims['height']:.2f} "
+          f"pts={len(pts)} conf={conf:.2f} depth_mean={zs.mean():.2f}m")
+
     return {
-        "object_id":  obj_meta["object_id"],
-        "label":      obj_meta.get("class", "unknown"),
-        "length":     dims["length"],
-        "width":      dims["width"],
-        "height":     dims["height"],
-        "volume_m3":  dims["volume_m3"],
-        "confidence": conf,
-        # extras (can be dropped if not needed)
-        "point_count": len(pts),
+        "object_id":    oid,
+        "label":        meta.get("class", "unknown"),
+        "length":       dims["length"],
+        "width":        dims["width"],
+        "height":       dims["height"],
+        "volume_m3":    dims["volume_m3"],
+        "confidence":   conf,
+        "point_count":  len(pts),
         "mean_depth_m": round(float(zs.mean()), 3),
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Flask endpoints
+# RLE decoder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _decode_rle(rle: dict | None, h: int, w: int) -> np.ndarray | None:
+    if rle is None:
+        return None
+    try:
+        counts = rle["counts"]
+        sh     = rle.get("shape", [h, w])
+        flat   = np.zeros(sh[0] * sh[1], dtype=np.uint8)
+        idx, val = 0, 0
+        for run in counts:
+            flat[idx: idx + run] = val
+            idx += run
+            val  = 1 - val
+        mask = flat.reshape(sh[0], sh[1])
+        if (sh[0], sh[1]) != (h, w):
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        return mask
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared frame decoder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _decode_frame(data: dict) -> np.ndarray | None:
+    raw = data.get("frame_b64")
+    if not raw:
+        return None
+    arr = np.frombuffer(base64.b64decode(raw), np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)   # None on failure
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Flask routes
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/health", methods=["GET"])
@@ -347,181 +338,84 @@ def health():
 
 @app.route("/depth", methods=["POST"])
 def endpoint_depth():
-    """
-    Stage 5 – per-point depth query.
-
-    Full contract (recommended):
-      Input:  { "frame_b64": "<base64 JPEG/PNG>",
-                "points":    [[u, v], ...] }
-      Output: { "depths": [z_meters, ...] }
-
-    Legacy contract (frame omitted – uses last cached depth map):
-      Input:  { "points": [[u, v], ...] }
-      Output: { "depths": [z_meters, ...] }
-
-    Note: always sending frame_b64 gives more accurate per-frame depth.
-    If Person A cannot send the frame, it should call /measure instead.
-    """
     global _last_depth_map
     try:
-        data = request.get_json(force=True)
+        data      = request.get_json(force=True)
+        bgr       = _decode_frame(data)
 
-        if "frame_b64" in data:
-            frame_bytes = base64.b64decode(data["frame_b64"])
-            nparr = np.frombuffer(frame_bytes, np.uint8)
-            bgr   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if bgr is None:
-                return jsonify({"error": "invalid image"}), 400
-            depth_map = _infer_depth(bgr)
-            _last_depth_map = depth_map          # cache for legacy callers
+        if bgr is not None:
+            depth_map       = _infer_depth(bgr)
+            _last_depth_map = depth_map
         elif _last_depth_map is not None:
-            depth_map = _last_depth_map          # legacy: reuse last frame
+            depth_map = _last_depth_map
         else:
-            return jsonify({"error": "no frame_b64 provided and no cached depth map"}), 400
+            return jsonify({"error": "no frame_b64 and no cached depth map"}), 400
 
-        h, w = depth_map.shape
-        points = data.get("points", [])
+        h, w   = depth_map.shape
         depths = []
-        for u, v in points:
-            u_c = int(np.clip(u, 0, w - 1))
-            v_c = int(np.clip(v, 0, h - 1))
-            depths.append(round(float(depth_map[v_c, u_c]), 3))
+        for u, v in data.get("points", []):
+            depths.append(round(float(
+                depth_map[int(np.clip(v, 0, h-1)), int(np.clip(u, 0, w-1))]
+            ), 3))
 
         return jsonify({"depths": depths})
 
     except Exception:
-        traceback.print_exc()
-        return jsonify({"error": "internal error"}), 500
+        err = traceback.format_exc()
+        print("[/depth] EXCEPTION:\n" + err)
+        return jsonify({"error": "internal error", "traceback": err}), 500
 
 
 @app.route("/measure", methods=["POST"])
 def endpoint_measure():
-    """
-    Stages 6-12 – full 3-D measurement for tracked objects
-    Input:
-      {
-        "frame_b64": "<base64 image>",
-        "objects": [
-          {
-            "object_id": 1,
-            "class": "Chair",
-            "confidence": 0.87,
-            "segmentation_score": 0.74,
-            "mask_stability": 0.91,
-            "mask_rle": {          // Run-length encoding of binary mask
-              "counts": [0,120,...],
-              "shape": [480, 640]
-            }
-          }, ...
-        ]
-      }
-    Output (Stage 12 format):
-      {
-        "objects": [
-          {
-            "object_id": 1,
-            "label": "Chair",
-            "length": 0.52,
-            "width": 0.55,
-            "height": 0.88,
-            "volume_m3": 0.251,
-            "confidence": 0.79
-          }, ...
-        ],
-        "inference_ms": 47.3
-      }
-    """
+    global _last_depth_map
     try:
-        t0 = time.perf_counter()
+        t0   = time.perf_counter()
         data = request.get_json(force=True)
 
-        # Decode frame
-        frame_bytes = base64.b64decode(data["frame_b64"])
-        nparr = np.frombuffer(frame_bytes, np.uint8)
-        bgr   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        bgr = _decode_frame(data)
         if bgr is None:
-            return jsonify({"error": "invalid image"}), 400
+            return jsonify({"error": "missing or unreadable frame_b64"}), 400
 
-        frame_h, frame_w = bgr.shape[:2]
+        n_objs = len(data.get("objects", []))
+        print(f"[/measure] frame {bgr.shape[1]}x{bgr.shape[0]}, {n_objs} objects")
 
-        # Run depth estimation once for the whole frame
-        global _last_depth_map
-        depth_map = _infer_depth(bgr)   # H×W float32 metres
-        _last_depth_map = depth_map     # keep for legacy /depth callers
+        depth_map       = _infer_depth(bgr)
+        _last_depth_map = depth_map
+        h, w            = depth_map.shape
 
-        # Measure each tracked object
+        print(f"[/measure] depth min={depth_map.min():.3f}m "
+              f"max={depth_map.max():.3f}m mean={depth_map.mean():.3f}m")
+
         results = []
         for obj in data.get("objects", []):
-            mask_np = _decode_mask(obj.get("mask_rle"), frame_h, frame_w)
-            if mask_np is None:
+            mask = _decode_rle(obj.get("mask_rle"), h, w)
+            if mask is None:
+                print(f"[/measure] obj {obj.get('object_id')} RLE decode failed")
                 continue
-            measured = _measure_object(depth_map, mask_np, obj)
-            if measured is not None:
-                results.append(measured)
+            m = _measure_object(depth_map, mask, obj)
+            if m is not None:
+                results.append(m)
 
-        elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
-        return jsonify({"objects": results, "inference_ms": elapsed_ms})
+        ms = round((time.perf_counter() - t0) * 1000, 1)
+        print(f"[/measure] done {ms}ms → {len(results)}/{n_objs} measured")
+        return jsonify({"objects": results, "inference_ms": ms})
 
     except Exception:
-        traceback.print_exc()
-        return jsonify({"error": "internal error"}), 500
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Mask encoding/decoding helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _decode_mask(
-    mask_rle: dict | None,
-    h: int,
-    w: int,
-) -> np.ndarray | None:
-    """Decode RLE mask dict → binary H×W numpy array."""
-    if mask_rle is None:
-        return None
-    try:
-        counts = mask_rle["counts"]
-        shape  = mask_rle.get("shape", [h, w])
-        flat   = np.zeros(shape[0] * shape[1], dtype=np.uint8)
-        idx    = 0
-        val    = 0
-        for run in counts:
-            flat[idx: idx + run] = val
-            idx += run
-            val = 1 - val
-        mask = flat.reshape(shape[0], shape[1])
-        if (shape[0], shape[1]) != (h, w):
-            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-        return mask
-    except Exception:
-        traceback.print_exc()
-        return None
-
-
-def encode_mask_rle(binary_mask: np.ndarray) -> dict:
-    """Encode a binary H×W numpy array as RLE (for the client side)."""
-    flat = binary_mask.flatten().tolist()
-    counts = []
-    run    = 0
-    cur    = 0
-    for v in flat:
-        if v == cur:
-            run += 1
-        else:
-            counts.append(run)
-            run = 1
-            cur = v
-    counts.append(run)
-    return {"counts": counts, "shape": list(binary_mask.shape)}
+        err = traceback.format_exc()
+        print("[/measure] EXCEPTION:\n" + err)
+        # Forward traceback to client so you can read it without switching terminals
+        return jsonify({"error": "internal error", "traceback": err}), 500
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 60)
-    print("ParcelVision Depth Server  (Stages 5-12)")
+    print("ParcelVision Depth Server")
+    print(f"  device  : {_device}")
     print("  GET  /health")
-    print("  POST /depth    – per-point depth query")
-    print("  POST /measure  – full 3-D measurement pipeline")
+    print("  POST /depth")
+    print("  POST /measure")
     print("=" * 60)
-    _load_depth_model()   # eager load
+    _load_depth_model()
     app.run(host="0.0.0.0", port=5000, threaded=False)
