@@ -1,27 +1,7 @@
-"""
-parcel_vision_server.py  –  ParcelVision fully integrated backend
-==================================================================
-Combines server.py (YOLO-World detection + tracking + scene state)
-with depth_server.py (DepthAnythingV2 / MiDaS + point cloud measurement)
-into a single process.
-
-Endpoints:
-  GET  /           health check
-  GET  /health     depth model status
-  POST /detect     { multipart image } → { scene: [...] }
-  GET  /scene      current scene snapshot
-
-Run:
-  python parcel_vision_server.py
-"""
-
 from __future__ import annotations
 
-import base64
 import sys
-import time
 import traceback
-from typing import Any
 
 import cv2
 import numpy as np
@@ -34,24 +14,31 @@ from ultralytics import YOLO
 from tracker import ObjectTracker
 from scene_state import SceneStateManager
 
+from segment_anything import sam_model_registry, SamPredictor
+
+prev_gray      = None
+prev_pts       = None
+motion_smooth  = 0.0
+calibrating    = False
+motion_accum   = 0.0
+prev_dimensions = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DepthAnything V2 import
+# DepthAnything
 # ─────────────────────────────────────────────────────────────────────────────
 
 sys.path.insert(0, "./Depth-Anything-V2")
+
 try:
     from depth_anything_v2.dpt import DepthAnythingV2
     _USE_DA2 = True
-    print("[server] DepthAnything V2 import OK")
-except ImportError as _e:
+except:
     _USE_DA2 = False
-    print(f"[server] DepthAnything V2 not found ({_e}) – will try MiDaS")
 
 try:
-    import timm  # noqa: F401
+    import timm
     _HAS_TIMM = True
-except ImportError:
+except:
     _HAS_TIMM = False
 
 
@@ -59,465 +46,378 @@ except ImportError:
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-CONF_THRESHOLD   = 0.3
-JPEG_QUALITY     = 70
+CONF_THRESHOLD = 0.01
 
-# Camera intrinsics — tune to your camera
-CAMERA_FX   = 525.0
-CAMERA_FY   = 525.0
-CAMERA_CX   = 320.0
-CAMERA_CY   = 240.0
-DEPTH_SCALE = 4.0     # relative-to-metric scale factor
+# Defaults — overridden per-request by EXIF-derived values from frontend
+CAMERA_FX = 554.0
+CAMERA_FY = 554.0
+CAMERA_CX = 320.0
+CAMERA_CY = 240.0
+DEPTH_SCALE = 4.0
 
+last_detections = []
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Flask setup
+# Flask
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
 CORS(app)
 
+_device = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Depth model state
+# Depth model
 # ─────────────────────────────────────────────────────────────────────────────
 
 _depth_model     = None
 _depth_transform = None
-_device          = "cuda" if torch.cuda.is_available() else "cpu"
-_model_type: str = "none"
-_last_depth_map: np.ndarray | None = None
+_model_type      = "none"
 
 
-def _load_depth_model() -> None:
+def _load_depth_model():
     global _depth_model, _depth_transform, _model_type
-
     if _depth_model is not None:
         return
 
-    # ── DepthAnything V2 ─────────────────────────────────────────────────────
     if _USE_DA2:
         try:
-            cfg = {
-                "encoder":      "vits",
-                "features":     64,
-                "out_channels": [48, 96, 192, 384],
-            }
-            model = DepthAnythingV2(**cfg)
-            state = torch.load(
-                "depth_anything_v2_vits.pth",
-                map_location=_device,
-                weights_only=True,
-            )
+            model = DepthAnythingV2(encoder="vits", features=64, out_channels=[48, 96, 192, 384])
+            state = torch.load("depth_anything_v2_vits.pth", map_location=_device)
             model.load_state_dict(state)
             model.to(_device).eval()
             _depth_model = model
             _model_type  = "da2"
-            print(f"[server] DA2 vits loaded on {_device}")
+            print("✅ DepthAnything V2 loaded")
             return
-        except Exception:
-            print("[server] DA2 load failed:")
-            traceback.print_exc()
-            print("[server] Falling back to MiDaS")
+        except Exception as e:
+            print(f"DA2 failed: {e}")
 
-    # ── MiDaS ────────────────────────────────────────────────────────────────
     if _HAS_TIMM:
         try:
-            midas = torch.hub.load(
-                "intel-isl/MiDaS", "MiDaS_small", trust_repo=True
-            )
+            midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
             midas.to(_device).eval()
-            transforms = torch.hub.load(
-                "intel-isl/MiDaS", "transforms", trust_repo=True
-            )
-            _depth_model     = midas
+            transforms     = torch.hub.load("intel-isl/MiDaS", "transforms")
+            _depth_model   = midas
             _depth_transform = transforms.small_transform
-            _model_type      = "midas"
-            print(f"[server] MiDaS_small loaded on {_device}")
+            _model_type    = "midas"
+            print("✅ MiDaS loaded")
             return
-        except Exception:
-            print("[server] MiDaS load failed:")
-            traceback.print_exc()
+        except Exception as e:
+            print(f"MiDaS failed: {e}")
 
-    # ── Dummy ─────────────────────────────────────────────────────────────────
     _model_type = "dummy"
-    print("[server] WARNING: using dummy depth model (horizontal gradient)")
+    print("⚠️  Using dummy depth — measurements will be wrong!")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Depth inference
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _infer_depth(bgr: np.ndarray) -> np.ndarray:
-    """Return float32 depth map in metres, H x W."""
+def _infer_depth(frame):
     _load_depth_model()
-    h, w = bgr.shape[:2]
+    h, w = frame.shape[:2]
 
     if _model_type == "da2":
-        with torch.no_grad():
-            depth = _depth_model.infer_image(bgr)
-        depth = np.asarray(depth, dtype=np.float32)
-        d_min, d_max = float(depth.min()), float(depth.max())
-        depth = (depth - d_min) / (d_max - d_min + 1e-8)
-        return (depth * DEPTH_SCALE).astype(np.float32)
+        depth = _depth_model.infer_image(frame)
+        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+        return depth * DEPTH_SCALE
 
     if _model_type == "midas":
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         inp = _depth_transform(rgb).to(_device)
         with torch.no_grad():
             pred = _depth_model(inp)
-        pred = F.interpolate(
-            pred.unsqueeze(1), size=(h, w),
-            mode="bicubic", align_corners=False
-        ).squeeze()
-        depth = pred.cpu().numpy().astype(np.float32)
+        pred  = F.interpolate(pred.unsqueeze(1), size=(h, w)).squeeze()
+        depth = pred.cpu().numpy()
         depth = 1.0 / (depth + 1e-8)
-        d_min, d_max = float(depth.min()), float(depth.max())
-        depth = (depth - d_min) / (d_max - d_min + 1e-8)
-        return (depth * DEPTH_SCALE).astype(np.float32)
+        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+        return depth * DEPTH_SCALE
 
-    # Dummy: horizontal gradient 0.5 … 4.5 m
-    row = np.linspace(0.5, 4.5, w, dtype=np.float32)
-    return np.tile(row, (h, 1))
+    return np.ones((h, w), dtype=np.float32)
+
+
+def estimate_ground_depth(depth_map):
+    h, w = depth_map.shape
+    ground_region = depth_map[int(h * 0.75):h, :]
+    return float(np.median(ground_region))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Geometry helpers
+# Geometry
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _pixels_to_3d(us: np.ndarray, vs: np.ndarray, zs: np.ndarray) -> np.ndarray:
-    X = (us - CAMERA_CX) * zs / CAMERA_FX
-    Y = (vs - CAMERA_CY) * zs / CAMERA_FY
-    return np.stack([X, Y, zs], axis=-1)   # (N, 3)
+def _pixels_to_3d(us, vs, zs, fx=None, fy=None, cx=None, cy=None):
+    fx = fx or CAMERA_FX
+    fy = fy or CAMERA_FY
+    cx = cx or CAMERA_CX
+    cy = cy or CAMERA_CY
+    X  = (us - cx) * zs / fx
+    Y  = (vs - cy) * zs / fy
+    return np.stack([X, Y, zs], axis=-1)
 
 
-def _filter_point_cloud(pts: np.ndarray) -> np.ndarray:
+def _filter_point_cloud(pts):
     if len(pts) < 10:
         return pts
-
-    centroid  = pts.mean(axis=0)
-    dists     = np.linalg.norm(pts - centroid, axis=1)
-    threshold = dists.mean() + 2.5 * dists.std()
-    pts = pts[dists < threshold]
-
-    if len(pts) > 20:
-        pts = pts[pts[:, 1] < np.percentile(pts[:, 1], 95)]
-
-    if len(pts) > 20:
-        z_lo = np.percentile(pts[:, 2], 3)
-        z_hi = np.percentile(pts[:, 2], 97)
-        pts  = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
-
-    return pts
+    centroid = pts.mean(axis=0)
+    dists    = np.linalg.norm(pts - centroid, axis=1)
+    return pts[dists < dists.mean() + 2.5 * dists.std()]
 
 
-def _fit_bounding_box(pts: np.ndarray) -> dict[str, float]:
+def _fit_bounding_box(pts):
     if len(pts) < 4:
-        return {"length": 0.0, "width": 0.0, "height": 0.0, "volume_m3": 0.0}
-
-    length = float(np.clip(pts[:, 0].max() - pts[:, 0].min(), 0.01, 10.0))
-    height = float(np.clip(pts[:, 1].max() - pts[:, 1].min(), 0.01, 10.0))
-    width  = float(np.clip(pts[:, 2].max() - pts[:, 2].min(), 0.01, 10.0))
-    return {
-        "length":    round(length, 3),
-        "width":     round(width,  3),
-        "height":    round(height, 3),
-        "volume_m3": round(length * width * height, 4),
-    }
+        return None
+    l = float(pts[:, 0].max() - pts[:, 0].min())
+    w = float(pts[:, 2].max() - pts[:, 2].min())
+    h = float(pts[:, 1].max() - pts[:, 1].min())
+    return {"length": l, "width": w, "height": h, "volume_m3": l * w * h}
 
 
-def _depth_confidence(zs: np.ndarray) -> float:
-    if len(zs) < 2:
-        return 0.5
-    return float(np.clip(1.0 - zs.std() / (zs.mean() + 1e-8), 0.0, 1.0))
-
-
-def _final_confidence(det: float, seg: float,
-                      depth_rel: float, track: float) -> float:
-    return round(float(np.clip(
-        0.30 * det + 0.30 * seg + 0.20 * depth_rel + 0.20 * track,
-        0.0, 1.0
-    )), 4)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-object measurement pipeline
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _measure_object(
-    depth_map: np.ndarray,
-    mask_np:   np.ndarray,
-    meta:      dict[str, Any],
-) -> dict[str, Any] | None:
-
-    oid = meta.get("object_id", "?")
-    h, w = depth_map.shape
-
-    if mask_np.shape != (h, w):
-        mask_np = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_NEAREST)
-
+def _measure_object(depth_map, mask_np, meta, fx=None, fy=None):
     vs, us = np.where(mask_np > 0.5)
-    if len(us) < 10:
-        print(f"[measure] id={oid} sparse mask ({len(us)} px) — skip")
+    if len(us) < 20:
+        print("❌ Mask too small")
         return None
 
-    zs    = depth_map[vs, us]
-    valid = zs > 0.05
-    us, vs, zs = us[valid], vs[valid], zs[valid]
-    if len(us) < 10:
-        print(f"[measure] id={oid} only {len(us)} px after depth filter — skip")
-        return None
-
-    if len(us) > 2000:
-        idx = np.random.choice(len(us), 2000, replace=False)
-        us, vs, zs = us[idx], vs[idx], zs[idx]
-
-    pts = _pixels_to_3d(us.astype(float), vs.astype(float), zs)
+    zs  = depth_map[vs, us]
+    pts = _pixels_to_3d(us, vs, zs, fx=fx, fy=fy)
     pts = _filter_point_cloud(pts)
-    if len(pts) < 4:
-        print(f"[measure] id={oid} only {len(pts)} pts after filter — skip")
+    box = _fit_bounding_box(pts)
+    if box is None:
         return None
 
-    dims = _fit_bounding_box(pts)
-    conf = _final_confidence(
-        det       = meta.get("confidence",         0.5),
-        seg       = meta.get("segmentation_score", 0.5),
-        depth_rel = _depth_confidence(zs),
-        track     = meta.get("mask_stability",     0.5),
-    )
+    print(f"✅ Measurement: L={box['length']:.2f} W={box['width']:.2f} H={box['height']:.2f}")
 
-    print(f"[measure] id={oid} "
-          f"L={dims['length']:.2f} W={dims['width']:.2f} H={dims['height']:.2f} "
-          f"pts={len(pts)} conf={conf:.2f} depth_mean={zs.mean():.2f}m")
+    obj_id = meta["object_id"]
+    alpha  = 0.7
+    if obj_id in prev_dimensions:
+        prev = prev_dimensions[obj_id]
+        box["length"] = alpha * prev["length"] + (1 - alpha) * box["length"]
+        box["width"]  = alpha * prev["width"]  + (1 - alpha) * box["width"]
+        box["height"] = alpha * prev["height"] + (1 - alpha) * box["height"]
 
-    return {
-        "object_id":    oid,
-        "label":        meta.get("class", "unknown"),
-        "length":       dims["length"],
-        "width":        dims["width"],
-        "height":       dims["height"],
-        "volume_m3":    dims["volume_m3"],
-        "confidence":   conf,
-        "point_count":  len(pts),
-        "mean_depth_m": round(float(zs.mean()), 3),
-    }
+    prev_dimensions[obj_id] = box
+    return {"object_id": meta["object_id"], "label": meta["class"], **box}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mask helpers
+# Models
 # ─────────────────────────────────────────────────────────────────────────────
 
-def bbox_to_mask(x1: int, y1: int, x2: int, y2: int,
-                 frame_h: int, frame_w: int) -> np.ndarray:
-    """
-    Filled bounding-box proxy mask.
-    yolov8s-world.pt produces no pixel masks, so we fill the bbox region.
-    Swap in a real segmentation mask here if you switch to yolo11n-seg.pt.
-    """
-    mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
-    x1c  = int(np.clip(x1, 0, frame_w - 1))
-    y1c  = int(np.clip(y1, 0, frame_h - 1))
-    x2c  = int(np.clip(x2, 0, frame_w - 1))
-    y2c  = int(np.clip(y2, 0, frame_h - 1))
-    mask[y1c:y2c, x1c:x2c] = 1
-    return mask
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# YOLO-World + tracker setup
-# ─────────────────────────────────────────────────────────────────────────────
-
-print("Loading YOLO model...")
-
+print("Loading YOLO World...")
 yolo_model = YOLO("yolov8s-world.pt")
 yolo_model.to(_device)
-
 yolo_model.set_classes([
-    "sofa",
-    "chair",
-    "table",
-    "cardboard box",
-    "carton box",
-    "shipping box",
-    "package",
+    "box", "cardboard box", "carton", "parcel",
+    "package", "container", "brown box",
+    "shipping box", "crate", "rectangular box",
 ])
+
+print("Loading SAM...")
+sam           = sam_model_registry["vit_b"](checkpoint="sam_vit_b_01ec64.pth")
+sam.to(_device)
+sam_predictor = SamPredictor(sam)
 
 tracker       = ObjectTracker()
 scene_manager = SceneStateManager()
 
-frame_index = 0
 
-torch.set_grad_enabled(False)
-print("YOLO model loaded successfully")
+# ─────────────────────────────────────────────────────────────────────────────
+# Motion
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_camera_motion(frame):
+    global prev_gray, prev_pts, motion_smooth
+
+    small = cv2.resize(frame, (320, 240))
+    gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+    if prev_gray is None:
+        prev_gray = gray
+        prev_pts  = cv2.goodFeaturesToTrack(gray, 300, 0.01, 5)
+        return 0.0
+
+    if prev_pts is None or len(prev_pts) < 10:
+        prev_pts  = cv2.goodFeaturesToTrack(gray, 300, 0.01, 5)
+        prev_gray = gray
+        return 0.0
+
+    next_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, prev_pts, None)
+    if next_pts is None:
+        prev_gray = gray
+        prev_pts  = None
+        return 0.0
+
+    good_old = prev_pts[status == 1]
+    good_new = next_pts[status == 1]
+
+    if len(good_old) < 5 or len(good_new) < 5:
+        prev_gray = gray
+        prev_pts  = None
+        return 0.0
+
+    movement      = np.linalg.norm(good_new - good_old, axis=1)
+    raw_motion    = float(np.mean(movement) * 5)
+    motion_smooth = 0.8 * motion_smooth + 0.2 * raw_motion
+
+    if np.random.rand() < 0.1:
+        prev_pts = cv2.goodFeaturesToTrack(gray, 300, 0.01, 5)
+    else:
+        prev_pts = good_new.reshape(-1, 1, 2)
+
+    prev_gray = gray
+    return motion_smooth
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.route("/")
-def home():
-    return jsonify({"message": "ParcelVision integrated server running"})
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    _load_depth_model()
-    return jsonify({
-        "status": "ok",
-        "depth_model": _model_type,
-        "device": _device,
-    })
-
-
 @app.route("/detect", methods=["POST"])
 def detect():
-    global _last_depth_map, frame_index
+    try:
+        if "image" not in request.files:
+            return jsonify({"error": "no image"}), 400
 
-    if "image" not in request.files:
-        return jsonify({"error": "No image provided"}), 400
+        run_detection = request.form.get("detect", "1") == "1"
+        print("RUN DETECTION:", run_detection)
 
-    t0    = time.perf_counter()
-    file  = request.files["image"]
-    npimg = np.frombuffer(file.read(), np.uint8)
-    frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+        file  = request.files["image"]
+        npimg = np.frombuffer(file.read(), np.uint8)
+        frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+        if frame is None:
+            return jsonify({"error": "invalid image"}), 400
 
-    if frame is None:
-        return jsonify({"error": "Could not decode image"}), 400
+        motion = compute_camera_motion(frame)
+        print(f"📍 Motion: {motion:.2f}")
 
-    orig_h, orig_w = frame.shape[:2]
-    frame_resized  = cv2.resize(frame, (416, 320))
+        global calibrating, motion_accum
+        if calibrating and motion > 0.5:
+            motion_accum += motion
 
-    # ── YOLO-World detection ─────────────────────────────────────────────────
-    results = yolo_model(frame_resized, verbose=False)[0]
+        h, w = frame.shape[:2]
 
-    boxes   = results.boxes.xyxy.cpu().numpy()
-    classes = results.boxes.cls.cpu().numpy()
-    confs   = results.boxes.conf.cpu().numpy()
+        # ── Read camera intrinsics from request ──
+        camera_height = float(request.form.get("camera_height", 1.5))
+        req_fx        = float(request.form.get("fx", CAMERA_FX))
+        req_fy        = float(request.form.get("fy", CAMERA_FY))
+        print(f"📷 fx={req_fx:.1f} fy={req_fy:.1f} cam_h={camera_height}m")
 
-    scale_x = orig_w / 416
-    scale_y = orig_h / 320
+        # ── Log raw EXIF tags on first frame ──
+        exif_debug = request.form.get("exif_debug")
+        exif_method = request.form.get("exif_method")
+        if exif_debug:
+            print(f"📷 EXIF RAW: {exif_debug}")
+            print(f"📷 EXIF METHOD: {exif_method}")
 
-    detections = []
-    for box, cls, conf in zip(boxes, classes, confs):
-        if conf < CONF_THRESHOLD:
-            continue
-
-        x1 = int(box[0] * scale_x)
-        y1 = int(box[1] * scale_y)
-        x2 = int(box[2] * scale_x)
-        y2 = int(box[3] * scale_y)
-
-        label  = yolo_model.names[int(cls)]
-        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-        area   = (x2 - x1) * (y2 - y1)
-
-        detections.append({
-            "bbox":           (x1, y1, x2, y2),
-            "confidence":     float(conf),
-            "center":         (cx, cy),
-            "area":           area,
-            "business_class": label,
-        })
-
-    # ── Tracker + scene state ─────────────────────────────────────────────────
-    detections   = tracker.update(detections)
-    scene_inv    = [
-        {
-            "object_id":      det["id"],
-            "label":          det["business_class"],
-            "confidence":     float(det["confidence"]),
-            "bbox":           det["bbox"],
-            "center":         det["center"],
-            "area":           det["area"],
-            "stability_score": det.get("stability_score", 0),
-        }
-        for det in detections
-    ]
-    scene_state  = scene_manager.update(scene_inv, frame_index)
-    frame_index += 1
-
-    # ── Depth inference ───────────────────────────────────────────────────────
-    measurements = {}
-
-    if scene_state:
-        try:
-            depth_map       = _infer_depth(frame)
-            _last_depth_map = depth_map
-            h_d, w_d        = depth_map.shape
-
-            print(f"[detect] depth min={depth_map.min():.3f}m "
-                  f"max={depth_map.max():.3f}m mean={depth_map.mean():.3f}m")
-
-            # ── Per-object measurement ────────────────────────────────────────
-            for obj in scene_state.values():
-                x1, y1, x2, y2 = obj["bbox"]
-                mask_np = bbox_to_mask(x1, y1, x2, y2, orig_h, orig_w)
-
-                # Resize mask to depth map resolution if needed
-                if mask_np.shape != (h_d, w_d):
-                    mask_np = cv2.resize(
-                        mask_np, (w_d, h_d), interpolation=cv2.INTER_NEAREST
-                    )
-
-                meta = {
-                    "object_id":          obj["id"],
-                    "class":              obj["label"],
-                    "confidence":         obj["confidence"],
-                    "segmentation_score": obj.get("stability", obj["confidence"]),
-                    "mask_stability":     obj.get("stability", 0.5),
-                }
-
-                m = _measure_object(depth_map, mask_np, meta)
-                if m is not None:
-                    measurements[obj["id"]] = m
-
-        except Exception:
-            print("[detect] depth/measurement error:")
-            traceback.print_exc()
-
-    # ── Merge measurements into scene state ───────────────────────────────────
-    for obj in scene_state.values():
-        oid = obj["id"]
-        if oid in measurements:
-            m = measurements[oid]
-            obj["dimensions"] = {
-                "length":    m["length"],
-                "width":     m["width"],
-                "height":    m["height"],
-                "depth":     m["width"],
-                "volume_m3": m["volume_m3"],
-            }
-            obj["measurement_confidence"] = m["confidence"]
-            obj["mean_depth_m"]           = m.get("mean_depth_m")
+        # ── Detection ──
+        if run_detection:
+            results = yolo_model(frame, verbose=False)[0]
+            boxes   = results.boxes.xyxy.cpu().numpy()
+            classes = results.boxes.cls.cpu().numpy()
+            confs   = results.boxes.conf.cpu().numpy()
         else:
-            obj.setdefault("dimensions",             None)
-            obj.setdefault("measurement_confidence", None)
-            obj.setdefault("mean_depth_m",           None)
+            boxes, classes, confs = [], [], []
 
-    ms = round((time.perf_counter() - t0) * 1000, 1)
-    print(f"[detect] done {ms}ms | "
-          f"objects={len(scene_state)} measured={len(measurements)}")
+        print("RAW DETECTIONS:", len(boxes))
 
-    return jsonify({"scene": list(scene_state.values())})
+        if run_detection:
+            sam_predictor.set_image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            detections = []
+
+            for box, cls, conf in zip(boxes, classes, confs):
+                print(f"  Detected: {yolo_model.names[int(cls)]} conf={conf:.3f}")
+                if conf < CONF_THRESHOLD:
+                    continue
+
+                x1, y1, x2, y2 = map(int, box)
+                cx_    = (x1 + x2) / 2
+                cy_    = (y1 + y2) / 2
+                label  = yolo_model.names[int(cls)]
+
+                masks, _, _ = sam_predictor.predict(
+                    box=np.array([x1, y1, x2, y2]), multimask_output=False
+                )
+                mask_np = (masks[0] > 0.5).astype(np.uint8)
+
+                if mask_np.sum() < 20:
+                    print("⚠️  SAM weak mask → fallback bbox")
+                    mask_np = np.zeros((h, w), dtype=np.uint8)
+                    mask_np[y1:y2, x1:x2] = 1
+
+                detections.append({
+                    "bbox":           [x1, y1, x2, y2],
+                    "confidence":     float(conf),
+                    "mask":           mask_np,
+                    "business_class": label,
+                    "area":           float((x2 - x1) * (y2 - y1)),
+                    "center":         [float(cx_), float(cy_)],
+                })
+
+        # ── Depth + scale ──
+        depth_map = _infer_depth(frame)
+        ground    = estimate_ground_depth(depth_map)
+        print(f"GROUND DEPTH: {ground:.3f}  DEPTH MODEL: {_model_type}")
+        scale = camera_height / (ground + 1e-6)
+
+        global last_detections
+
+        # Non-detection frames: return cached scene (safe, no numpy)
+        if not run_detection:
+            return jsonify({"scene": last_detections, "motion": motion})
+
+        detections = tracker.update(detections)
+        scene      = []
+
+        for det in detections:
+            m = _measure_object(depth_map, det["mask"], {
+                "object_id": det["id"],
+                "class":     det["business_class"],
+            }, fx=req_fx, fy=req_fy)
+
+            if m is not None:
+                m["length"]   *= scale
+                m["width"]    *= scale
+                m["height"]   *= scale
+                m["volume_m3"] = m["length"] * m["width"] * m["height"]
+
+            scene.append({
+                "object_id":  int(det["id"]),
+                "label":      det["business_class"],
+                "confidence": float(det["confidence"]),
+                "bbox":       det["bbox"],
+                "center":     det["center"],
+                "dimensions": m,
+            })
+
+        # Only update cache when we got detections
+        if len(scene) > 0:
+            last_detections = scene
+
+        return jsonify({"scene": last_detections, "motion": motion})
+
+    except Exception as e:
+        print("ERROR:")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
-@app.route("/scene", methods=["GET"])
-def get_scene():
-    return jsonify({"scene": list(scene_manager.objects.values())})
+@app.route("/start_calibration", methods=["POST"])
+def start_calibration():
+    global calibrating, motion_accum
+    calibrating  = True
+    motion_accum = 0.0
+    return jsonify({"status": "started"})
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/end_calibration", methods=["POST"])
+def end_calibration():
+    global calibrating, motion_accum
+    calibrating = False
+    real_height = float(request.json.get("height", 1.2))
+    if motion_accum < 1e-5:
+        return jsonify({"error": "not enough motion"}), 400
+    scale = real_height / motion_accum
+    return jsonify({"scale": scale, "motion": motion_accum})
+
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("ParcelVision Integrated Server")
-    print(f"  device      : {_device}")
-    print("  GET  /health")
-    print("  POST /detect")
-    print("  GET  /scene")
-    print("=" * 60)
-    _load_depth_model()
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=5000)
