@@ -13,14 +13,13 @@ from ultralytics import YOLO
 
 from tracker import ObjectTracker
 from scene_state import SceneStateManager
-
 from segment_anything import sam_model_registry, SamPredictor
 
-prev_gray      = None
-prev_pts       = None
-motion_smooth  = 0.0
-calibrating    = False
-motion_accum   = 0.0
+prev_gray       = None
+prev_pts        = None
+motion_smooth   = 0.0
+calibrating     = False
+motion_accum    = 0.0
 prev_dimensions = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,12 +47,10 @@ except:
 
 CONF_THRESHOLD = 0.01
 
-# Defaults — overridden per-request by EXIF-derived values from frontend
+# Camera intrinsic defaults — always overridden by frontend values
+# CX/CY updated per-request from actual stream dimensions
 CAMERA_FX = 554.0
 CAMERA_FY = 554.0
-CAMERA_CX = 320.0
-CAMERA_CY = 240.0
-DEPTH_SCALE = 4.0
 
 last_detections = []
 
@@ -96,12 +93,12 @@ def _load_depth_model():
 
     if _HAS_TIMM:
         try:
-            midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
+            midas      = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
             midas.to(_device).eval()
-            transforms     = torch.hub.load("intel-isl/MiDaS", "transforms")
-            _depth_model   = midas
+            transforms       = torch.hub.load("intel-isl/MiDaS", "transforms")
+            _depth_model     = midas
             _depth_transform = transforms.small_transform
-            _model_type    = "midas"
+            _model_type      = "midas"
             print("✅ MiDaS loaded")
             return
         except Exception as e:
@@ -118,7 +115,7 @@ def _infer_depth(frame):
     if _model_type == "da2":
         depth = _depth_model.infer_image(frame)
         depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-        return depth * DEPTH_SCALE
+        return depth   # normalized 0→1, no arbitrary scale
 
     if _model_type == "midas":
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -129,28 +126,28 @@ def _infer_depth(frame):
         depth = pred.cpu().numpy()
         depth = 1.0 / (depth + 1e-8)
         depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-        return depth * DEPTH_SCALE
+        return depth   # normalized 0→1, no arbitrary scale
 
     return np.ones((h, w), dtype=np.float32)
 
 
 def estimate_ground_depth(depth_map):
-    h, w = depth_map.shape
-    ground_region = depth_map[int(h * 0.75):h, :]
-    return float(np.median(ground_region))
+    h, w  = depth_map.shape
+    region = depth_map[int(h * 0.75):h, :]
+    val    = float(np.median(region))
+    # guard: if bottom region looks wrong, try bottom row only
+    if val < 0.05:
+        val = float(np.median(depth_map[h - 10:h, :]))
+    return max(val, 1e-6)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Geometry
+# Geometry — no hardcoded fx, uses per-request values
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _pixels_to_3d(us, vs, zs, fx=None, fy=None, cx=None, cy=None):
-    fx = fx or CAMERA_FX
-    fy = fy or CAMERA_FY
-    cx = cx or CAMERA_CX
-    cy = cy or CAMERA_CY
-    X  = (us - cx) * zs / fx
-    Y  = (vs - cy) * zs / fy
+def _pixels_to_3d(us, vs, zs, fx, fy, cx, cy):
+    X = (us - cx) * zs / fx
+    Y = (vs - cy) * zs / fy
     return np.stack([X, Y, zs], axis=-1)
 
 
@@ -165,20 +162,20 @@ def _filter_point_cloud(pts):
 def _fit_bounding_box(pts):
     if len(pts) < 4:
         return None
-    l = float(pts[:, 0].max() - pts[:, 0].min())
-    w = float(pts[:, 2].max() - pts[:, 2].min())
-    h = float(pts[:, 1].max() - pts[:, 1].min())
+    l = float(pts[:, 0].max() - pts[:, 0].min())  # X spread = horizontal
+    w = float(pts[:, 2].max() - pts[:, 2].min())  # Z spread = depth (noisy)
+    h = float(pts[:, 1].max() - pts[:, 1].min())  # Y spread = vertical
     return {"length": l, "width": w, "height": h, "volume_m3": l * w * h}
 
 
-def _measure_object(depth_map, mask_np, meta, fx=None, fy=None):
+def _measure_object(depth_map, mask_np, meta, fx, fy, cx, cy):
     vs, us = np.where(mask_np > 0.5)
     if len(us) < 20:
         print("❌ Mask too small")
         return None
 
     zs  = depth_map[vs, us]
-    pts = _pixels_to_3d(us, vs, zs, fx=fx, fy=fy)
+    pts = _pixels_to_3d(us, vs, zs, fx, fy, cx, cy)
     pts = _filter_point_cloud(pts)
     box = _fit_bounding_box(pts)
     if box is None:
@@ -187,9 +184,11 @@ def _measure_object(depth_map, mask_np, meta, fx=None, fy=None):
     print(f"✅ Measurement: L={box['length']:.2f} W={box['width']:.2f} H={box['height']:.2f}")
 
     obj_id = meta["object_id"]
-    alpha  = 0.7
+
+    # no smoothing on first detection, smooth on subsequent
     if obj_id in prev_dimensions:
-        prev = prev_dimensions[obj_id]
+        alpha = 0.7
+        prev  = prev_dimensions[obj_id]
         box["length"] = alpha * prev["length"] + (1 - alpha) * box["length"]
         box["width"]  = alpha * prev["width"]  + (1 - alpha) * box["width"]
         box["height"] = alpha * prev["height"] + (1 - alpha) * box["height"]
@@ -258,11 +257,9 @@ def compute_camera_motion(frame):
     raw_motion    = float(np.mean(movement) * 5)
     motion_smooth = 0.8 * motion_smooth + 0.2 * raw_motion
 
-    if np.random.rand() < 0.1:
-        prev_pts = cv2.goodFeaturesToTrack(gray, 300, 0.01, 5)
-    else:
-        prev_pts = good_new.reshape(-1, 1, 2)
-
+    prev_pts  = (cv2.goodFeaturesToTrack(gray, 300, 0.01, 5)
+                 if np.random.rand() < 0.1
+                 else good_new.reshape(-1, 1, 2))
     prev_gray = gray
     return motion_smooth
 
@@ -293,22 +290,29 @@ def detect():
         if calibrating and motion > 0.5:
             motion_accum += motion
 
-        h, w = frame.shape[:2]
-
-        # ── Read camera intrinsics from request ──
+        # ── Camera params from frontend ──────────────────────────────────
         camera_height = float(request.form.get("camera_height", 1.5))
         req_fx        = float(request.form.get("fx", CAMERA_FX))
         req_fy        = float(request.form.get("fy", CAMERA_FY))
-        print(f"📷 fx={req_fx:.1f} fy={req_fy:.1f} cam_h={camera_height}m")
 
-        # ── Log raw EXIF tags on first frame ──
-        exif_debug = request.form.get("exif_debug")
+        # use actual stream dimensions for correct cx/cy
+        img_w  = int(request.form.get("img_w", frame.shape[1]))
+        img_h  = int(request.form.get("img_h", frame.shape[0]))
+        req_cx = img_w / 2.0
+        req_cy = img_h / 2.0
+
+        print(f"📷 fx={req_fx:.1f} fy={req_fy:.1f} cx={req_cx} cy={req_cy} cam_h={camera_height}m")
+
+        # log EXIF debug once
+        exif_debug  = request.form.get("exif_debug")
         exif_method = request.form.get("exif_method")
         if exif_debug:
-            print(f"📷 EXIF RAW: {exif_debug}")
+            print(f"📷 EXIF RAW:    {exif_debug}")
             print(f"📷 EXIF METHOD: {exif_method}")
 
-        # ── Detection ──
+        # ── Detection ────────────────────────────────────────────────────
+        h, w = frame.shape[:2]
+
         if run_detection:
             results = yolo_model(frame, verbose=False)[0]
             boxes   = results.boxes.xyxy.cpu().numpy()
@@ -329,9 +333,7 @@ def detect():
                     continue
 
                 x1, y1, x2, y2 = map(int, box)
-                cx_    = (x1 + x2) / 2
-                cy_    = (y1 + y2) / 2
-                label  = yolo_model.names[int(cls)]
+                label = yolo_model.names[int(cls)]
 
                 masks, _, _ = sam_predictor.predict(
                     box=np.array([x1, y1, x2, y2]), multimask_output=False
@@ -349,18 +351,17 @@ def detect():
                     "mask":           mask_np,
                     "business_class": label,
                     "area":           float((x2 - x1) * (y2 - y1)),
-                    "center":         [float(cx_), float(cy_)],
+                    "center":         [float((x1 + x2) / 2), float((y1 + y2) / 2)],
                 })
 
-        # ── Depth + scale ──
+        # ── Depth + scale ─────────────────────────────────────────────────
         depth_map = _infer_depth(frame)
         ground    = estimate_ground_depth(depth_map)
-        print(f"GROUND DEPTH: {ground:.3f}  DEPTH MODEL: {_model_type}")
-        scale = camera_height / (ground + 1e-6)
+        scale     = camera_height / ground
+        print(f"GROUND DEPTH: {ground:.3f}  SCALE: {scale:.3f}  MODEL: {_model_type}")
 
         global last_detections
 
-        # Non-detection frames: return cached scene (safe, no numpy)
         if not run_detection:
             return jsonify({"scene": last_detections, "motion": motion})
 
@@ -368,16 +369,17 @@ def detect():
         scene      = []
 
         for det in detections:
-            m = _measure_object(depth_map, det["mask"], {
-                "object_id": det["id"],
-                "class":     det["business_class"],
-            }, fx=req_fx, fy=req_fy)
+            m = _measure_object(
+                depth_map, det["mask"],
+                {"object_id": det["id"], "class": det["business_class"]},
+                fx=req_fx, fy=req_fy, cx=req_cx, cy=req_cy,
+            )
 
             if m is not None:
-                m["length"]   *= scale
-                m["width"]    *= scale
-                m["height"]   *= scale
-                m["volume_m3"] = m["length"] * m["width"] * m["height"]
+                m["length"]    *= scale
+                m["width"]     *= scale
+                m["height"]    *= scale
+                m["volume_m3"]  = m["length"] * m["width"] * m["height"]
 
             scene.append({
                 "object_id":  int(det["id"]),
@@ -388,7 +390,6 @@ def detect():
                 "dimensions": m,
             })
 
-        # Only update cache when we got detections
         if len(scene) > 0:
             last_detections = scene
 
