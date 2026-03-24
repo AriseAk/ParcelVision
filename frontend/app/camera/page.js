@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react"
 import ExifReader from "exifreader"
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://192.168.1.104:5000"
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://172.18.192.1:5000"
 
 const CLASS_COLORS = {
   box:             { r: 226, g: 183, b: 20  },
@@ -20,28 +20,16 @@ function colorFor(label) {
 }
 
 // ── Derive fx from whatever the browser exposes ───────────────────────────
-// Priority:
-//   1. getCapabilities() zoom + stream dimensions (Android Chrome)
-//   2. EXIF FocalLength + FocalPlaneXResolution
-//   3. EXIF FocalLengthIn35mmFilm with crop correction
-//   4. FOV fallback using stream aspect ratio
 function deriveFocalLength(track, exifTags, streamW, streamH) {
-  // ── Method 1: use zoom from capabilities ──────────────────────────────
+  // Method 1: use zoom from capabilities
   try {
     const capabilities = track.getCapabilities?.() ?? {}
     const settings     = track.getSettings?.()     ?? {}
     const zoom         = settings.zoom ?? 1.0
-
-    // Base FOV for main rear camera at zoom=1 is ~70° horizontal for most phones
-    // fx = (streamW / 2) / tan(hfov/2)
-    // At zoom=1, hfov ≈ 70°. At zoom=2, hfov ≈ 35° etc.
-    // effective_hfov = 2 * arctan(tan(base_hfov/2) / zoom)
     const baseHfovRad  = (70 * Math.PI) / 180
     const effHfovRad   = 2 * Math.atan(Math.tan(baseHfovRad / 2) / zoom)
     const fx           = (streamW / 2) / Math.tan(effHfovRad / 2)
-
-    // If capabilities exposes a zoom range, we can trust this more
-    const hasZoomCap = capabilities.zoom?.min != null
+    const hasZoomCap   = capabilities.zoom?.min != null
     if (hasZoomCap || zoom !== 1.0) {
       return {
         fx, fy: fx,
@@ -50,12 +38,11 @@ function deriveFocalLength(track, exifTags, streamW, streamH) {
     }
   } catch (e) {}
 
-  // ── Method 2: EXIF FocalLength + FocalPlaneXResolution ────────────────
+  // Method 2: EXIF FocalLength + FocalPlaneXResolution
   try {
     const focalMm = exifTags["FocalLength"]?.value
     const fpxRes  = exifTags["FocalPlaneXResolution"]?.value
     const fpxUnit = exifTags["FocalPlaneResolutionUnit"]?.value
-
     if (focalMm && fpxRes && fpxUnit) {
       const pxPerMm = fpxUnit === 2 ? fpxRes / 25.4 : fpxRes / 10
       const fx      = focalMm * pxPerMm * (streamW / 640)
@@ -63,28 +50,20 @@ function deriveFocalLength(track, exifTags, streamW, streamH) {
     }
   } catch (e) {}
 
-  // ── Method 3: EXIF FocalLengthIn35mmFilm ──────────────────────────────
+  // Method 3: EXIF FocalLengthIn35mmFilm
   try {
     const f35 = exifTags["FocalLengthIn35mmFilm"]?.value
     if (f35 && f35 > 0) {
-      // 35mm frame = 36mm wide. fx_35mm = f35 * (36mm_frame_px / 36mm)
-      // scaled to our stream: fx = (f35 / 36) * streamW * crop_factor
-      // phone sensor ~5.6mm → crop = 36/5.6 ≈ 6.43
       const fx = (f35 * streamW) / 5.6
       return { fx, fy: fx, method: `EXIF f35=${f35}mm` }
     }
   } catch (e) {}
 
-  // ── Method 4: FOV from stream aspect ratio ────────────────────────────
-  // Most phone rear cameras: 4:3 native, hfov ~70°, vfov ~53°
-  // Wide lens: hfov ~120°. We can't distinguish without extra info.
-  // Use stream aspect to pick reasonable default.
-  const aspect   = streamW / streamH
-  // 4:3 aspect → main lens → 70° hfov
-  // 16:9 aspect → may be cropped from wider lens → use 75°
-  const hfovDeg  = aspect > 1.6 ? 75 : 70
-  const hfovRad  = (hfovDeg * Math.PI) / 180
-  const fx       = (streamW / 2) / Math.tan(hfovRad / 2)
+  // Method 4: FOV from stream aspect ratio fallback
+  const aspect  = streamW / streamH
+  const hfovDeg = aspect > 1.6 ? 75 : 70
+  const hfovRad = (hfovDeg * Math.PI) / 180
+  const fx      = (streamW / 2) / Math.tan(hfovRad / 2)
   return { fx, fy: fx, method: `fallback ${hfovDeg}° hfov aspect=${aspect.toFixed(2)}` }
 }
 
@@ -97,14 +76,27 @@ export default function CameraPage() {
   const focalRef   = useRef(null)
   const streamDims = useRef({ w: 640, h: 480 })
 
-  const [objects,      setObjects]      = useState([])
-  const [fps,          setFps]          = useState(0)
-  const [connected,    setConnected]    = useState(false)
-  const [isMoving,     setIsMoving]     = useState(false)
-  const [motion,       setMotion]       = useState(0)
-  const [cameraHeight, setCameraHeight] = useState(null)
-  const [focalInfo,    setFocalInfo]    = useState(null)
-  const [showSidebar,  setShowSidebar]  = useState(false)
+  // ── Bbox interpolation refs  (STEP 1) ──────────────────────────────────
+  const lerpedObjectsRef = useRef({})
+
+  // ── IMU collection refs  (STEP 5) ──────────────────────────────────────
+  const imuBufferRef = useRef([])
+  const imuActiveRef = useRef(false)
+
+  // ── Scan state  (STEP 6) ───────────────────────────────────────────────
+  const scanningRef = useRef(false)
+
+  const [objects,         setObjects]         = useState([])
+  const [fps,             setFps]             = useState(0)
+  const [connected,       setConnected]       = useState(false)
+  const [isMoving,        setIsMoving]        = useState(false)
+  const [motion,          setMotion]          = useState(0)
+  const [cameraHeight,    setCameraHeight]    = useState(null)
+  const [focalInfo,       setFocalInfo]       = useState(null)
+  const [showSidebar,     setShowSidebar]     = useState(false)
+  const [scanState,       setScanState]       = useState('idle')      // idle | scanning | computing | result
+  const [finalDimensions, setFinalDimensions] = useState(null)
+  const [scanFrameCount,  setScanFrameCount]  = useState(0)
 
   const fpsFrames = useRef(0)
   const fpsTimer  = useRef(null)
@@ -129,14 +121,12 @@ export default function CameraPage() {
         videoRef.current.onloadedmetadata = () => {
           videoRef.current.play().catch(() => {})
 
-          // ── Get actual stream dimensions ──
           const track    = stream.getVideoTracks()[0]
           const settings = track.getSettings?.() ?? {}
           const sw       = settings.width  || videoRef.current.videoWidth  || 640
           const sh       = settings.height || videoRef.current.videoHeight || 480
           streamDims.current = { w: sw, h: sh }
 
-          // ── Derive focal length from track + capabilities ──
           const focal = deriveFocalLength(track, {}, sw, sh)
           focalRef.current = { fx: focal.fx, fy: focal.fy, method: focal.method }
           setFocalInfo(`fx=${focal.fx.toFixed(0)} (${focal.method})`)
@@ -144,7 +134,7 @@ export default function CameraPage() {
 
           if (!loopsRef.current) {
             loopsRef.current = true
-            startLoops()
+            startDetectionLoop()   // STEP 1 — replaces startLoops
             startRenderLoop()
             fpsTimer.current = setInterval(() => {
               setFps(fpsFrames.current)
@@ -161,7 +151,7 @@ export default function CameraPage() {
     return () => { if (fpsTimer.current) clearInterval(fpsTimer.current) }
   }, [cameraHeight])
 
-  // ── Try EXIF once to refine focal length ─────────────────────────────
+  // ── EXIF refinement ───────────────────────────────────────────────────
   async function tryRefineWithExif(blob) {
     if (focalRef.current?.exifDone) return
     try {
@@ -177,7 +167,6 @@ export default function CameraPage() {
       focalRef.current = { fx: focal.fx, fy: focal.fy, method: focal.method, exifDone: true }
       setFocalInfo(`fx=${focal.fx.toFixed(0)} (${focal.method})`)
 
-      // send debug to backend once
       const exifDebug = {}
       ;["FocalLength","FocalLengthIn35mmFilm","FocalPlaneXResolution",
         "FocalPlaneResolutionUnit","Make","Model"].forEach(k => {
@@ -188,6 +177,55 @@ export default function CameraPage() {
     } catch (e) {
       if (focalRef.current) focalRef.current.exifDone = true
     }
+  }
+
+  // ── Detection loop  (STEP 1 — fires on response, not fixed interval) ──
+  function startDetectionLoop() {
+    async function loop() {
+      while (loopsRef.current) {
+        if (document.visibilityState === 'hidden') {
+          await new Promise(res => setTimeout(res, 500))
+          continue
+        }
+        // only run idle detection when not in a scan
+        if (!scanningRef.current) {
+          await captureAndDetect(true)
+        }
+        await new Promise(res => setTimeout(res, 200))
+      }
+    }
+    loop()
+  }
+
+  // ── Bbox interpolation helpers  (STEP 1) ──────────────────────────────
+  function updateDetectionTargets(scene) {
+    scene.forEach(obj => {
+      if (!lerpedObjectsRef.current[obj.object_id]) {
+        lerpedObjectsRef.current[obj.object_id] = {
+          ...obj,
+          currentBbox: [...obj.bbox],
+          targetBbox:  [...obj.bbox],
+        }
+      } else {
+        lerpedObjectsRef.current[obj.object_id].targetBbox  = [...obj.bbox]
+        lerpedObjectsRef.current[obj.object_id].dimensions  = obj.dimensions
+        lerpedObjectsRef.current[obj.object_id].confidence  = obj.confidence
+      }
+    })
+    const activeIds = new Set(scene.map(o => o.object_id))
+    Object.keys(lerpedObjectsRef.current).forEach(id => {
+      if (!activeIds.has(parseInt(id))) delete lerpedObjectsRef.current[id]
+    })
+  }
+
+  function lerpBboxes() {
+    Object.values(lerpedObjectsRef.current).forEach(obj => {
+      const alpha = 0.2
+      obj.currentBbox[0] += (obj.targetBbox[0] - obj.currentBbox[0]) * alpha
+      obj.currentBbox[1] += (obj.targetBbox[1] - obj.currentBbox[1]) * alpha
+      obj.currentBbox[2] += (obj.targetBbox[2] - obj.currentBbox[2]) * alpha
+      obj.currentBbox[3] += (obj.targetBbox[3] - obj.currentBbox[3]) * alpha
+    })
   }
 
   async function captureAndDetect(runDetection) {
@@ -227,11 +265,13 @@ export default function CameraPage() {
         }
 
         try {
-          const res  = await fetch(`${BACKEND_URL}/detect`, { method: "POST", body: form })
-          const data = await res.json()
+          const res   = await fetch(`${BACKEND_URL}/detect`, { method: "POST", body: form })
+          const data  = await res.json()
           const scene     = data.scene  ?? []
           const motionVal = data.motion ?? 0
+
           objectsRef.current = scene
+          updateDetectionTargets(scene)   // STEP 1
           setObjects(scene)
           setMotion(motionVal)
           setIsMoving(motionVal > 2)
@@ -249,24 +289,144 @@ export default function CameraPage() {
     }
   }
 
-  function startLoops() {
-    let counter = 0
-    setInterval(() => {
-      if (detectRef.current) return
-      counter++
-      captureAndDetect(counter % 4 === 0)
-    }, 100)
-  }
-
+  // ── Render loop  (STEP 1 — lerps bboxes at 60fps) ─────────────────────
   function startRenderLoop() {
     function render() {
-      drawOverlays(objectsRef.current)
+      lerpBboxes()
+      drawOverlays(Object.values(lerpedObjectsRef.current))
       fpsFrames.current++
       requestAnimationFrame(render)
     }
     requestAnimationFrame(render)
   }
 
+  // ── IMU collection  (STEP 5) ───────────────────────────────────────────
+  function startIMUCollection() {
+    if (typeof DeviceMotionEvent === 'undefined') {
+      console.warn('DeviceMotion not available — scan accuracy will be lower')
+      return
+    }
+    if (typeof DeviceMotionEvent.requestPermission === 'function') {
+      DeviceMotionEvent.requestPermission()
+        .then(state => {
+          if (state === 'granted') attachIMUListener()
+          else console.warn('IMU permission denied')
+        })
+        .catch(console.error)
+    } else {
+      attachIMUListener()
+    }
+  }
+
+  function stopIMUCollection() {
+    imuActiveRef.current = false
+  }
+
+  function attachIMUListener() {
+    imuActiveRef.current = true
+    window.addEventListener('devicemotion', (e) => {
+      if (!imuActiveRef.current) return
+      imuBufferRef.current.push({
+        ts: Date.now(),
+        ax: e.acceleration?.x     ?? 0,
+        ay: e.acceleration?.y     ?? 0,
+        az: e.acceleration?.z     ?? 0,
+        gx: e.rotationRate?.alpha ?? 0,
+        gy: e.rotationRate?.beta  ?? 0,
+        gz: e.rotationRate?.gamma ?? 0,
+      })
+      if (imuBufferRef.current.length > 30) {
+        imuBufferRef.current.shift()
+      }
+    }, false)
+  }
+
+  // ── Scan handlers  (STEPS 6, 7) ───────────────────────────────────────
+  async function handleStartScan() {
+    imuBufferRef.current = []
+    setScanFrameCount(0)
+    scanningRef.current = true
+    setScanState('scanning')
+    startIMUCollection()
+
+    await fetch(`${BACKEND_URL}/start_scan`, { method: 'POST' })
+    runScanLoop()
+  }
+
+  async function runScanLoop() {
+    while (scanningRef.current) {
+      const video = videoRef.current
+      if (!video) break
+
+      const sw = streamDims.current.w
+      const sh = streamDims.current.h
+
+      const tmp = document.createElement('canvas')
+      tmp.width  = sw
+      tmp.height = sh
+      tmp.getContext('2d').drawImage(video, 0, 0, sw, sh)
+
+      const blob = await new Promise(res => tmp.toBlob(res, 'image/jpeg', 0.7))
+
+      const imuSnapshot    = [...imuBufferRef.current]
+      imuBufferRef.current = []
+
+      await sendScanFrame(blob, imuSnapshot)
+      setScanFrameCount(c => c + 1)
+
+      await new Promise(res => setTimeout(res, 150))
+    }
+  }
+
+  async function sendScanFrame(blob, imuReadings) {
+    const focal = focalRef.current ?? { fx: 554, fy: 554 }
+    const form  = new FormData()
+
+    form.append('image',         blob, 'frame.jpg')
+    form.append('imu',           JSON.stringify(imuReadings))
+    form.append('camera_height', cameraHeight)
+    form.append('fx',            focal.fx.toFixed(2))
+    form.append('fy',            focal.fy.toFixed(2))
+    form.append('img_w',         streamDims.current.w)
+    form.append('img_h',         streamDims.current.h)
+
+    try {
+      await fetch(`${BACKEND_URL}/scan_frame`, { method: 'POST', body: form })
+    } catch (e) {
+      console.error('scan frame failed', e)
+    }
+  }
+
+  async function handleDoneScan() {
+    scanningRef.current = false
+    stopIMUCollection()
+    setScanState('computing')
+
+    try {
+      const res  = await fetch(`${BACKEND_URL}/compute_dimensions`, { method: 'POST' })
+      const data = await res.json()
+
+      if (data.error) {
+        console.error('compute error:', data.error)
+        setScanState('idle')
+        return
+      }
+
+      setFinalDimensions(data.dimensions)
+      setScanState('result')
+    } catch (e) {
+      console.error('compute_dimensions failed', e)
+      setScanState('idle')
+    }
+  }
+
+  function handleScanAgain() {
+    setFinalDimensions(null)
+    setScanFrameCount(0)
+    setScanState('idle')
+  }
+
+  // ── Canvas drawing — uses currentBbox from lerped objects ─────────────
   function drawOverlays(scene) {
     const canvas = canvasRef.current
     const video  = videoRef.current
@@ -280,8 +440,10 @@ export default function CameraPage() {
     ctx.drawImage(video, 0, 0, sw, sh)
 
     scene.forEach((obj) => {
-      if (!obj.bbox) return
-      const [x1, y1, x2, y2] = obj.bbox
+      // use interpolated bbox (STEP 1)
+      const bbox = obj.currentBbox ?? obj.bbox
+      if (!bbox) return
+      const [x1, y1, x2, y2] = bbox
       const { r, g, b } = colorFor(obj.label)
       const w = x2 - x1
       const h = y2 - y1
@@ -340,7 +502,7 @@ export default function CameraPage() {
     })
   }
 
-  // ── Responsive layout: phone = stacked, desktop = side by side ──────────
+  // ── Layout ──────────────────────────────────────────────────────────────
   return (
     <div style={{
       display: "flex",
@@ -360,7 +522,7 @@ export default function CameraPage() {
         <canvas ref={canvasRef} style={{
           display: "block",
           width: "100vw",
-          height: "56.25vw",   /* 16:9 */
+          height: "56.25vw",
           maxHeight: "60dvh",
           objectFit: "cover",
           background: "#1e1f2e",
@@ -376,6 +538,69 @@ export default function CameraPage() {
         }}>
           {isMoving ? "● MOVING" : "● STABLE"} | {motion.toFixed(1)}
         </div>
+
+        {/* ── Scan button — idle, has detections  (STEP 6) ── */}
+        {scanState === 'idle' && objects.length > 0 && (
+          <button onClick={handleStartScan} style={{
+            position: "absolute", bottom: 48, left: "50%", transform: "translateX(-50%)",
+            background: "#e2b714", color: "#2b2d3e",
+            border: "none", borderRadius: "6px",
+            padding: "10px 28px", fontSize: "13px", fontWeight: 700,
+            fontFamily: "inherit", cursor: "pointer", letterSpacing: "0.1em",
+            boxShadow: "0 2px 12px rgba(0,0,0,0.4)",
+          }}>
+            START SCAN
+          </button>
+        )}
+
+        {/* ── Scanning overlay  (STEP 6) ── */}
+        {scanState === 'scanning' && (
+          <div style={{
+            position: "absolute", bottom: 48, left: "50%", transform: "translateX(-50%)",
+            background: "rgba(30,31,46,0.95)", border: "1px solid #e2b714",
+            borderRadius: "8px", padding: "12px 20px",
+            display: "flex", flexDirection: "column", alignItems: "center", gap: "8px",
+            minWidth: "220px",
+          }}>
+            <p style={{ margin: 0, fontSize: "12px", color: "#e2b714", letterSpacing: "0.08em" }}>
+              Walk slowly around the box
+            </p>
+            <p style={{ margin: 0, fontSize: "11px", color: "#646579" }}>
+              {scanFrameCount} frames collected
+            </p>
+            <button onClick={handleDoneScan} style={{
+              background: "#e2b714", color: "#2b2d3e",
+              border: "none", borderRadius: "4px",
+              padding: "7px 24px", fontSize: "12px", fontWeight: 700,
+              fontFamily: "inherit", cursor: "pointer", letterSpacing: "0.08em",
+            }}>
+              DONE
+            </button>
+          </div>
+        )}
+
+        {/* ── Computing overlay  (STEP 6) ── */}
+        {scanState === 'computing' && (
+          <div style={{
+            position: "absolute", inset: 0,
+            background: "rgba(30,31,46,0.85)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}>
+            <div style={{
+              fontSize: "14px", color: "#e2b714", letterSpacing: "0.12em",
+              display: "flex", alignItems: "center", gap: "10px",
+            }}>
+              <span style={{
+                display: "inline-block", width: "14px", height: "14px",
+                border: "2px solid #e2b714", borderTopColor: "transparent",
+                borderRadius: "50%",
+                animation: "spin 0.8s linear infinite",
+              }} />
+              COMPUTING DIMENSIONS…
+            </div>
+            <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+          </div>
+        )}
 
         {/* status bar */}
         <div style={{
@@ -394,7 +619,6 @@ export default function CameraPage() {
           <span>h:{cameraHeight?.toFixed(1)}m</span>
           {focalInfo && <span style={{ color: "#e2b714", fontSize: "10px" }}>📷 {focalInfo}</span>}
 
-          {/* toggle sidebar button — mobile only */}
           <button
             onClick={() => setShowSidebar(s => !s)}
             style={{
@@ -420,7 +644,6 @@ export default function CameraPage() {
         flexDirection: "column",
         gap: "8px",
         background: "#272935",
-        // on wider screens always show
         ...(typeof window !== "undefined" && window.innerWidth > 640
           ? { display: "flex" }
           : {}),
@@ -435,7 +658,55 @@ export default function CameraPage() {
           <span style={{ color: "#e2b714" }}>{objects.length} detected</span>
         </div>
 
-        {objects.length === 0 && (
+        {/* ── Scan result card  (STEP 6) ── */}
+        {scanState === 'result' && finalDimensions && (
+          <div style={{
+            background: "#2b2d3e",
+            border: "1px solid rgba(226,183,20,0.6)",
+            borderRadius: "8px", padding: "14px",
+            marginBottom: "4px",
+          }}>
+            <div style={{
+              fontSize: "10px", color: "#e2b714", letterSpacing: "0.15em",
+              marginBottom: "10px", textTransform: "uppercase",
+            }}>
+              Scan Result
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "6px", marginBottom: "8px" }}>
+              {[
+                { label: "L", value: `${finalDimensions.length.toFixed(2)}m` },
+                { label: "W", value: `${finalDimensions.width.toFixed(2)}m`  },
+                { label: "H", value: `${finalDimensions.height.toFixed(2)}m` },
+              ].map(({ label, value }) => (
+                <div key={label} style={{ background: "#323347", borderRadius: "4px", padding: "6px", textAlign: "center" }}>
+                  <div style={{ fontSize: "9px", color: "#646579", letterSpacing: "0.1em" }}>{label}</div>
+                  <div style={{ fontSize: "14px", color: "#d1d0c5", marginTop: "2px" }}>{value}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{
+              background: "#323347", borderRadius: "4px", padding: "8px 10px",
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              marginBottom: "10px",
+            }}>
+              <span style={{ fontSize: "9px", color: "#646579", letterSpacing: "0.1em" }}>VOLUME</span>
+              <span style={{ fontSize: "16px", color: "#e2b714", fontWeight: 700 }}>
+                {finalDimensions.volume_m3.toFixed(3)} m³
+              </span>
+            </div>
+            <button onClick={handleScanAgain} style={{
+              width: "100%",
+              background: "#323347", color: "#d1d0c5",
+              border: "1px solid #646579", borderRadius: "4px",
+              padding: "8px", fontSize: "11px", fontWeight: 600,
+              fontFamily: "inherit", cursor: "pointer", letterSpacing: "0.08em",
+            }}>
+              SCAN AGAIN
+            </button>
+          </div>
+        )}
+
+        {objects.length === 0 && scanState === 'idle' && (
           <div style={{ color: "#646579", fontSize: "12px", marginTop: "16px", textAlign: "center" }}>
             point camera at a box
           </div>
