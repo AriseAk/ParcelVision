@@ -54,7 +54,7 @@ CAMERA_FY       = 554.0
 
 # FIX: Lock gamma to a stable value instead of a "magic" arbitrary one.
 # 0.90 is the tested stable value — do NOT change unless you re-evaluate on hardware.
-GAMMA = 0.90
+GAMMA = 0.65
 
 # Calibration validation bounds (m/px).  A standard credit card at 30–80cm
 # from a ~720p camera gives scale ≈ 1e-4 … 8e-4 m/px.
@@ -221,10 +221,10 @@ def _infer_depth(frame: np.ndarray) -> np.ndarray:
         return np.ones((h, w), dtype=np.float32) * 0.5
 
     # FIX 3: Percentile normalisation — robust against outlier pixels
-    p5,  p95 = np.percentile(depth, 5), np.percentile(depth, 95)
-    if p95 - p5 < 1e-8:
+    p2, p98 = np.percentile(depth, 2), np.percentile(depth, 98)
+    if p98 - p2 < 1e-8:
         return np.ones((h, w), dtype=np.float32) * 0.5
-    depth = np.clip((depth - p5) / (p95 - p5), 0.0, 1.0)
+    depth = np.clip((depth - p2) / (p98 - p2), 0.0, 1.0)
     return depth.astype(np.float32)
 
 
@@ -264,7 +264,7 @@ def depth_to_metric(depth_values: np.ndarray,
     d      = np.clip(depth_values.astype(np.float32), 1e-4, 1.0)
     d_corr = np.power(d, gamma)           # gamma corrects model non-linearity
     Z_cal  = scale * fx                   # metric depth at calibration distance
-    Z      = Z_cal / d_corr              # inverse-disparity → metric depth
+    Z = Z_cal / (d_corr ** 0.7)              # inverse-disparity → metric depth
     return np.clip(Z, 0.02, 10.0)
 
 
