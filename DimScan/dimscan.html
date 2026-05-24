@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>DimScan</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%;overflow:hidden;background:#0a0a0c;color:#e8e8f0;font-family:'Space Mono',monospace;touch-action:manipulation}
+  :root{
+    --bg:#0a0a0c;--panel:#111115;--border:#1e1e26;
+    --accent:#ff6b35;--teal:#00ffcc;--yellow:#f5c518;
+    --muted:#555568;--danger:#ff4444;--text:#e8e8f0;
+  }
+  .screen{display:none;flex-direction:column;height:100dvh;overflow:hidden}
+  .screen.active{display:flex}
+
+  /* Splash */
+  #splash{align-items:center;justify-content:center;gap:16px}
+  .logo{font-family:'Syne',sans-serif;font-size:40px;font-weight:800;letter-spacing:-1px}
+  .logo span{color:var(--accent)}
+  .sub{font-size:11px;color:var(--muted);letter-spacing:3px;text-transform:uppercase}
+  .spinner{width:28px;height:28px;border-radius:50%;border:2px solid var(--border);border-top-color:var(--accent);animation:spin .8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* Error */
+  #error-screen{align-items:center;justify-content:center;gap:20px;padding:32px;text-align:center}
+  .err-msg{color:var(--danger);font-size:13px;line-height:1.6}
+
+  /* Viewport */
+  .viewport{position:relative;flex:0 0 54dvh;background:#000;overflow:hidden}
+  .viewport video,.viewport canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  .viewport canvas{pointer-events:none}
+
+  /* Sheet */
+  .sheet{flex:1;background:var(--panel);border-top:1px solid var(--border);padding:16px 16px 24px;overflow-y:auto;display:flex;flex-direction:column;gap:12px}
+
+  /* Tap screen */
+  .viewport.tappable{touch-action:none;cursor:crosshair}
+  .tap-prompt{position:absolute;bottom:12px;left:12px;right:12px;background:rgba(10,10,12,.88);border:1px solid;border-radius:4px;padding:10px 12px;pointer-events:none;backdrop-filter:blur(6px)}
+  .tap-prompt-title{font-size:13px;font-weight:700;letter-spacing:1px}
+  .tap-prompt-hint{font-size:10px;color:rgba(255,255,255,.5);margin-top:3px}
+  .all-tapped-banner{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);background:rgba(0,255,204,.1);border:1px solid var(--teal);color:var(--teal);border-radius:4px;padding:8px 16px;font-size:12px;letter-spacing:1px;white-space:nowrap;display:none}
+
+  /* Progress */
+  .prog-wrap{display:flex;flex-direction:column;gap:5px}
+  .prog-track{height:4px;background:var(--border);border-radius:2px;overflow:hidden}
+  .prog-fill{height:100%;border-radius:2px;background:var(--yellow);width:0;transition:width .4s ease,background .3s}
+  .prog-label{display:flex;justify-content:space-between;font-size:10px;color:var(--muted);letter-spacing:1px}
+
+  /* Checklist */
+  .checklist{display:flex;flex-direction:column;gap:8px}
+  .check-item{display:flex;gap:12px;align-items:flex-start;border:1px solid var(--border);border-radius:4px;padding:10px 12px;transition:border-color .2s,background .2s}
+  .check-dot{width:20px;height:20px;border-radius:50%;border:2px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;transition:all .2s}
+  .check-name{font-size:12px;font-weight:700;margin-bottom:2px}
+  .check-hint{font-size:10px;color:var(--muted)}
+
+  /* Status */
+  .screen-title{font-family:'Syne',sans-serif;font-size:22px;font-weight:800;letter-spacing:-.5px}
+  .face-title{font-family:'Syne',sans-serif;font-size:19px;font-weight:800}
+  .face-sub{font-size:10px;color:var(--muted);letter-spacing:1px}
+  .status-line{font-size:11px;color:var(--teal);letter-spacing:.5px;min-height:16px}
+
+  /* Info / warn boxes */
+  .info-box{background:rgba(0,255,204,.05);border:1px solid rgba(0,255,204,.15);border-radius:4px;padding:8px 12px;font-size:10px;color:var(--teal);line-height:1.7}
+  .warn-box{background:rgba(245,197,24,.08);border:1px solid rgba(245,197,24,.3);border-radius:4px;padding:10px 12px;font-size:11px;color:var(--yellow);line-height:1.5}
+  .err-inline{background:rgba(255,68,68,.08);border:1px solid rgba(255,68,68,.3);border-radius:4px;padding:10px 12px;font-size:11px;color:var(--danger);line-height:1.5}
+
+  /* Cam height badge */
+  .cam-badge{position:absolute;top:10px;right:10px;background:rgba(0,0,0,.75);border:1px solid var(--teal);border-radius:4px;padding:4px 8px;font-size:10px;color:var(--teal);display:none}
+  .cam-badge.show{display:block}
+
+  /* Turn screen */
+  #turn-screen{align-items:center;justify-content:center;background:var(--bg);padding:28px}
+  .turn-inner{display:flex;flex-direction:column;gap:20px;align-items:center;max-width:360px;width:100%}
+  .turn-icon{font-size:72px;color:var(--accent);line-height:1}
+  .turn-title{font-family:'Syne',sans-serif;font-size:26px;font-weight:800;text-align:center}
+  .turn-sub{font-size:12px;color:var(--muted);text-align:center;line-height:1.6}
+  .face-preview{background:var(--panel);border:1px solid rgba(0,255,204,.25);border-radius:6px;padding:14px 18px;width:100%;text-align:center}
+  .face-preview-label{font-size:10px;color:var(--teal);letter-spacing:2px;margin-bottom:6px}
+  .face-preview-dims{font-family:'Syne',sans-serif;font-size:22px;font-weight:800}
+  .turn-list{display:flex;flex-direction:column;gap:10px;width:100%}
+  .turn-step{display:flex;gap:10px;align-items:center;font-size:12px;color:#aaa}
+  .turn-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);flex-shrink:0}
+
+  /* Result */
+  #result-screen{background:var(--bg);padding:20px;overflow-y:auto}
+  .result-header{display:flex;align-items:center;justify-content:space-between;padding-top:8px;margin-bottom:14px}
+  .result-title{font-family:'Syne',sans-serif;font-size:24px;font-weight:800}
+  .quality-badge{font-size:10px;letter-spacing:2px;padding:4px 10px;border:1px solid;border-radius:2px}
+  .big-dims{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px}
+  .dim-card{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:12px 8px;display:flex;flex-direction:column;align-items:center;gap:4px}
+  .dim-label{font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--muted)}
+  .dim-value{font-family:'Syne',sans-serif;font-size:28px;font-weight:800;line-height:1}
+  .dim-unit{font-size:10px;color:var(--muted)}
+  .vol-card{background:var(--panel);border:1px solid rgba(255,107,53,.2);border-radius:6px;padding:14px 16px;display:flex;align-items:center;gap:10px;margin-bottom:10px}
+  .vol-num{font-family:'Syne',sans-serif;font-size:32px;font-weight:800;color:var(--accent);flex:1}
+  .qual-row{display:flex;gap:8px;margin-bottom:10px}
+  .qual-badge{background:var(--bg);border:1px solid;border-radius:4px;padding:6px 10px;flex:1}
+  .qual-badge-label{font-size:9px;color:var(--muted);letter-spacing:1px}
+  .qual-badge-val{font-size:12px;margin-top:2px}
+  .breakdown{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:12px 14px;display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
+  .breakdown-row{display:flex;justify-content:space-between;align-items:center;font-size:12px}
+  .breakdown-key{color:var(--muted);font-size:11px}
+
+  /* Buttons */
+  .btn{display:block;width:100%;padding:13px 16px;border:none;border-radius:4px;font-family:'Space Mono',monospace;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;cursor:pointer;transition:opacity .15s;-webkit-appearance:none}
+  .btn:active{opacity:.75}
+  .btn:disabled{opacity:.3;cursor:not-allowed}
+  .btn-primary{background:var(--accent);color:#fff}
+  .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--border)}
+  .btn-row{display:flex;gap:8px}
+  .btn-row .btn{flex:1}
+</style>
+</head>
+<body>
+
+<!-- Splash -->
+<div id="splash" class="screen active">
+  <div class="logo">DIM<span>SCAN</span></div>
+  <div class="sub">Initialising camera</div>
+  <div class="spinner"></div>
+</div>
+
+<!-- Error -->
+<div id="error-screen" class="screen">
+  <div class="logo">DIM<span>SCAN</span></div>
+  <div class="err-msg" id="err-msg"></div>
+  <button class="btn btn-primary" style="width:180px" onclick="location.reload()">Retry</button>
+</div>
+
+<!-- ── CALIBRATION TAP SCREEN ── -->
+<div id="calib-screen" class="screen">
+  <div class="viewport tappable" id="calib-viewport">
+    <video id="calib-video" playsinline muted autoplay></video>
+    <canvas id="calib-canvas"></canvas>
+    <div class="tap-prompt" id="calib-prompt">
+      <div class="tap-prompt-title" id="calib-prompt-title" style="color:var(--accent)">TAP → TOP LEFT CORNER</div>
+      <div class="tap-prompt-hint" id="calib-prompt-hint">Tap the top-left corner of the credit card</div>
+    </div>
+    <div class="all-tapped-banner" id="calib-all-tapped">All 4 corners tapped ✓</div>
+    <div class="cam-badge" id="cam-badge">CAM: —</div>
+  </div>
+  <div class="sheet">
+    <div class="screen-title">Calibrate Floor</div>
+    <div class="status-line" id="calib-status">Place credit card flat on the floor, then tap all 4 corners</div>
+    <div class="prog-wrap">
+      <div class="prog-track"><div class="prog-fill" id="cal-prog"></div></div>
+      <div class="prog-label">
+        <span id="cal-count">0 / 5 frames</span>
+        <span id="cal-reproj"></span>
+      </div>
+    </div>
+    <div class="info-box">
+      <strong>How to calibrate:</strong><br>
+      1. Lay credit card flat on the floor (same surface as box)<br>
+      2. Tap all 4 corners of the card in order: TL → TR → BR → BL<br>
+      3. Repeat 5× moving phone slightly each time<br>
+      4. Confirm once you have 3+ frames
+    </div>
+    <div class="checklist" id="calib-checklist"></div>
+    <div class="err-inline" id="calib-err" style="display:none"></div>
+    <div class="btn-row">
+      <button class="btn btn-ghost" id="calib-reset-btn" style="flex:0 0 auto;width:auto;padding:13px 14px;display:none" onclick="resetCalibTaps()">Reset</button>
+      <button class="btn btn-primary" id="calib-submit-btn" disabled onclick="submitCalibFrame()">0/4 tapped</button>
+    </div>
+    <button class="btn btn-ghost" id="calib-confirm-btn" disabled onclick="confirmCalibration()" style="margin-top:-4px">Confirm calibration (need 3+)</button>
+  </div>
+</div>
+
+<!-- ── BOX MEASUREMENT TAP SCREEN ── -->
+<div id="tap-screen" class="screen">
+  <div class="viewport tappable" id="tap-viewport">
+    <video id="tap-video" playsinline muted autoplay></video>
+    <canvas id="tap-overlay"></canvas>
+    <div class="tap-prompt" id="tap-prompt">
+      <div class="tap-prompt-title" id="tap-prompt-title">TAP → BOTTOM LEFT</div>
+      <div class="tap-prompt-hint" id="tap-prompt-hint">Where the left vertical edge meets the floor</div>
+    </div>
+    <div class="all-tapped-banner" id="all-tapped-banner">All 3 corners tapped ✓</div>
+  </div>
+  <div class="sheet">
+    <div>
+      <div class="face-title" id="face-title">① Front Face</div>
+      <div class="face-sub" id="face-subtitle">FACING YOU DIRECTLY</div>
+    </div>
+    <div class="checklist" id="checklist"></div>
+    <div class="err-inline" id="tap-err" style="display:none"></div>
+    <div class="btn-row">
+      <button class="btn btn-ghost" style="flex:0 0 auto;width:auto;padding:13px 14px" onclick="tapBack()">← Back</button>
+      <button class="btn btn-ghost" style="flex:0 0 auto;width:auto;padding:13px 14px;display:none" id="reset-taps-btn" onclick="resetBoxTaps()">Reset</button>
+      <button class="btn btn-primary" id="measure-btn" disabled onclick="submitFace()">0/3 tapped</button>
+    </div>
+  </div>
+</div>
+
+<!-- Turn screen -->
+<div id="turn-screen" class="screen">
+  <div class="turn-inner">
+    <div class="turn-icon">↻</div>
+    <div class="turn-title">Rotate the Box</div>
+    <div class="turn-sub">Turn the box 90° so a different face is toward you</div>
+    <div class="face-preview">
+      <div class="face-preview-label">FRONT FACE MEASURED ✓</div>
+      <div class="face-preview-dims" id="turn-dims">— × — cm</div>
+      <div style="font-size:10px;color:var(--muted);margin-top:4px" id="turn-residual"></div>
+    </div>
+    <div class="turn-list">
+      <div class="turn-step"><div class="turn-dot"></div><span>Keep box on the same floor as the card</span></div>
+      <div class="turn-step"><div class="turn-dot"></div><span>Rotate 90° toward you — side face now faces camera</span></div>
+      <div class="turn-step"><div class="turn-dot"></div><span>Tap the same 3 corner types on this face</span></div>
+    </div>
+    <button class="btn btn-primary" onclick="startSideFace()">Tap Side Face →</button>
+    <button class="btn btn-ghost" onclick="redoFrontFace()">← Redo Front Face</button>
+  </div>
+</div>
+
+<!-- Result screen -->
+<div id="result-screen" class="screen">
+  <div class="result-header">
+    <div class="result-title">Measurement</div>
+    <div class="quality-badge" id="quality-badge"></div>
+  </div>
+  <div class="big-dims">
+    <div class="dim-card"><div class="dim-label">Length</div><div class="dim-value" id="res-l" style="color:var(--accent)">—</div><div class="dim-unit">cm</div></div>
+    <div class="dim-card"><div class="dim-label">Width</div><div class="dim-value" id="res-w" style="color:var(--yellow)">—</div><div class="dim-unit">cm</div></div>
+    <div class="dim-card"><div class="dim-label">Height</div><div class="dim-value" id="res-h" style="color:var(--teal)">—</div><div class="dim-unit">cm</div></div>
+  </div>
+  <div class="vol-card">
+    <div><div style="font-size:10px;letter-spacing:2px;color:var(--muted)">VOLUME</div>
+         <div style="font-size:9px;color:var(--muted);margin-top:2px">L × W × H</div></div>
+    <div class="vol-num" id="res-vol">—</div>
+    <div style="font-size:11px;color:var(--muted)">cm³</div>
+  </div>
+  <div class="qual-row">
+    <div class="qual-badge" id="qb-consist"><div class="qual-badge-label">HEIGHT CONSISTENCY</div><div class="qual-badge-val">—</div></div>
+    <div class="qual-badge" id="qb-r1"><div class="qual-badge-label">FACE 1 RESIDUAL</div><div class="qual-badge-val">—</div></div>
+    <div class="qual-badge" id="qb-r2"><div class="qual-badge-label">FACE 2 RESIDUAL</div><div class="qual-badge-val">—</div></div>
+  </div>
+  <div class="breakdown">
+    <div class="breakdown-row"><span class="breakdown-key">Front face</span><span id="res-f1">—</span></div>
+    <div class="breakdown-row"><span class="breakdown-key">Side face</span><span id="res-f2">—</span></div>
+    <div class="breakdown-row"><span class="breakdown-key">Camera height</span><span id="res-camh" style="color:var(--muted)">—</span></div>
+  </div>
+  <div class="warn-box" id="result-warn" style="display:none"></div>
+  <div class="btn-row" style="margin-top:auto">
+    <button class="btn btn-primary" onclick="rescan()">⟳ Rescan</button>
+    <button class="btn btn-ghost" onclick="resetAll()">Reset All</button>
+  </div>
+</div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────────────────────────────────────
+// Auto-detect backend: use the origin that served this page so the app
+// works with any ngrok URL, localhost, or LAN address without editing code.
+const API_BASE = window.location.origin;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────────────────────────────────────
+let stream      = null;
+let calFrames   = 0;
+let calibTapped = {};    // { tl, tr, br, bl }  — for calibration
+let boxTapped   = {};    // { bl, br, tl }       — for box measurement
+let currentFace = 'front';
+let face1       = null;
+let face2       = null;
+
+// Calibration corner order: TL → TR → BR → BL
+const CALIB_ORDER = ['tl', 'tr', 'br', 'bl'];
+const CALIB_CORNERS = {
+  tl: { label: 'Top Left',     color: '#00ffcc', hint: 'Top-left corner of the credit card' },
+  tr: { label: 'Top Right',    color: '#f5c518', hint: 'Top-right corner of the credit card' },
+  br: { label: 'Bottom Right', color: '#ff6b35', hint: 'Bottom-right corner of the credit card' },
+  bl: { label: 'Bottom Left',  color: '#cc44ff', hint: 'Bottom-left corner of the credit card' },
+};
+
+// Box corner order: BL → BR → TL
+const BOX_ORDER = ['bl', 'br', 'tl'];
+const BOX_CORNERS = {
+  bl: { label: 'Bottom Left',  color: '#ff6b35', hint: 'Where the left vertical edge meets the floor' },
+  br: { label: 'Bottom Right', color: '#f5c518', hint: 'Where the right vertical edge meets the floor' },
+  tl: { label: 'Top Left',     color: '#00ffcc', hint: 'Top of the left vertical edge' },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCREEN ROUTING
+// ─────────────────────────────────────────────────────────────────────────────
+function showScreen(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CAMERA INTRINSICS
+// ─────────────────────────────────────────────────────────────────────────────
+function getCameraIntrinsics(videoId) {
+  const v = document.getElementById(videoId);
+  const W = v.videoWidth  || 1280;
+  const H = v.videoHeight || 720;
+  let fx = null;
+  let fxSource = '';
+
+  try {
+    if (stream) {
+      const settings = stream.getVideoTracks()[0].getSettings();
+      console.log(`[cam] stream res=${settings.width}×${settings.height}  video=${W}×${H}`);
+      if (settings.focalLengthStandard35mm > 0) {
+        // focalLengthStandard35mm is 35mm-equiv focal length; sensor width = 36mm
+        const candidate = (settings.focalLengthStandard35mm / 36.0) * W;
+        // Accept 10°–120° HFOV (ultra-wide through telephoto)
+        const fxMin = (W / 2) / Math.tan((120 * Math.PI / 180) / 2);
+        const fxMax = (W / 2) / Math.tan((10  * Math.PI / 180) / 2);
+        if (candidate >= fxMin && candidate <= fxMax) {
+          fx = candidate;
+          fxSource = `35mm API (${settings.focalLengthStandard35mm}mm eq)`;
+        } else {
+          console.warn(`[cam] 35mm API fx=${candidate.toFixed(0)} out of range [${fxMin.toFixed(0)},${fxMax.toFixed(0)}], ignoring`);
+        }
+      }
+    }
+  } catch(e) { console.warn('[cam] getSettings error:', e); }
+
+  if (!fx) {
+    // NOTE: fx is only a starting hint — the backend self-calibrates the true
+    // fx from the card's known geometry during finalize(), so this fallback
+    // only affects per-frame PnP rejection thresholds, not the final result.
+    fx = (W / 2) / Math.tan((65 * Math.PI / 180) / 2);
+    fxSource = 'fallback 65° HFOV (backend will self-calibrate)';
+  }
+
+  console.log(`[cam] fx=${Math.round(fx)} source="${fxSource}" res=${W}×${H}`);
+  return { fx: Math.round(fx), cx: W/2, cy: H/2, img_w: W, img_h: H };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CAMERA INIT
+// ─────────────────────────────────────────────────────────────────────────────
+async function initCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false,
+    });
+    ['calib-video', 'tap-video'].forEach(id => {
+      const v = document.getElementById(id);
+      v.srcObject = stream;
+      v.play().catch(() => {});
+    });
+    await new Promise(res => {
+      const v = document.getElementById('calib-video');
+      if (v.readyState >= 1) return res();
+      v.onloadedmetadata = res;
+    });
+    initCalibScreen();
+    showScreen('calib-screen');
+  } catch(e) {
+    document.getElementById('err-msg').textContent = 'Camera denied: ' + e.message;
+    showScreen('error-screen');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FRAME CAPTURE
+// ─────────────────────────────────────────────────────────────────────────────
+const _cc = document.createElement('canvas');
+async function captureBlob(videoId, q = 0.92) {
+  const v = document.getElementById(videoId);
+  _cc.width  = v.videoWidth  || 1280;
+  _cc.height = v.videoHeight || 720;
+  _cc.getContext('2d').drawImage(v, 0, 0);
+  return new Promise(res => _cc.toBlob(b => res(b), 'image/jpeg', q));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TAP COORDINATE MAPPING (CSS px → video px, handles object-fit:cover)
+// ─────────────────────────────────────────────────────────────────────────────
+function mapTap(clientX, clientY, viewportId, videoId) {
+  const rect = document.getElementById(viewportId).getBoundingClientRect();
+  const v    = document.getElementById(videoId);
+  const vidW = v.videoWidth  || 1280;
+  const vidH = v.videoHeight || 720;
+  const scale   = Math.max(rect.width / vidW, rect.height / vidH);
+  const offsetX = (vidW * scale - rect.width)  / 2;
+  const offsetY = (vidH * scale - rect.height) / 2;
+  return [
+    Math.round((clientX - rect.left + offsetX) / scale),
+    Math.round((clientY - rect.top  + offsetY) / scale),
+  ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CALIBRATION SCREEN
+// ─────────────────────────────────────────────────────────────────────────────
+function initCalibScreen() {
+  calibTapped = {};
+  renderCalibChecklist();
+  updateCalibPrompt();
+  clearCanvas(document.getElementById('calib-canvas'));
+  updateCalibButtons();
+}
+
+function renderCalibChecklist() {
+  const el = document.getElementById('calib-checklist');
+  el.innerHTML = '';
+  CALIB_ORDER.forEach(key => {
+    const c   = CALIB_CORNERS[key];
+    const div = document.createElement('div');
+    div.className = 'check-item';
+    div.id        = 'cci-' + key;
+    div.innerHTML = `
+      <div class="check-dot" id="ccd-${key}" style="border-color:${c.color}"></div>
+      <div>
+        <div class="check-name" id="ccn-${key}" style="color:var(--muted)">${c.label}</div>
+        <div class="check-hint">${c.hint}</div>
+      </div>`;
+    el.appendChild(div);
+  });
+}
+
+function updateCalibChecklist() {
+  CALIB_ORDER.forEach(key => {
+    const done   = !!calibTapped[key];
+    const active = nextCalibCorner() === key;
+    const c      = CALIB_CORNERS[key];
+    const dot    = document.getElementById('ccd-' + key);
+    const name   = document.getElementById('ccn-' + key);
+    const item   = document.getElementById('cci-' + key);
+    dot.style.background  = done ? c.color : 'transparent';
+    dot.style.borderColor = done || active ? c.color : 'var(--border)';
+    dot.textContent       = done ? '✓' : '';
+    name.style.color      = done ? c.color : active ? 'var(--text)' : 'var(--muted)';
+    item.style.borderColor= done ? c.color + '60' : active ? c.color + '40' : 'var(--border)';
+    item.style.background = done ? c.color + '12' : 'transparent';
+  });
+}
+
+function nextCalibCorner()   { return CALIB_ORDER.find(k => !calibTapped[k]) || null; }
+function allCalibTapped()    { return CALIB_ORDER.every(k => !!calibTapped[k]); }
+
+function updateCalibPrompt() {
+  const next   = nextCalibCorner();
+  const prompt = document.getElementById('calib-prompt');
+  const banner = document.getElementById('calib-all-tapped');
+  if (allCalibTapped()) {
+    prompt.style.display = 'none';
+    banner.style.display = 'block';
+  } else if (next) {
+    prompt.style.display = 'block';
+    banner.style.display = 'none';
+    const c = CALIB_CORNERS[next];
+    prompt.style.borderColor = c.color;
+    prompt.style.background  = c.color + '18';
+    document.getElementById('calib-prompt-title').textContent = 'TAP → ' + c.label.toUpperCase();
+    document.getElementById('calib-prompt-title').style.color = c.color;
+    document.getElementById('calib-prompt-hint').textContent  = c.hint;
+  }
+}
+
+function updateCalibButtons() {
+  const n = Object.keys(calibTapped).length;
+  const submitBtn  = document.getElementById('calib-submit-btn');
+  const resetBtn   = document.getElementById('calib-reset-btn');
+  const confirmBtn = document.getElementById('calib-confirm-btn');
+  submitBtn.disabled  = !allCalibTapped();
+  submitBtn.textContent = allCalibTapped() ? 'Submit Frame →' : n + '/4 tapped';
+  resetBtn.style.display = n > 0 ? 'block' : 'none';
+  confirmBtn.disabled   = calFrames < 1;
+  confirmBtn.textContent = calFrames >= 3
+    ? `Confirm Calibration (${calFrames} frames)`
+    : calFrames >= 1
+      ? `Confirm (${calFrames} frame — add more for accuracy)`
+      : 'Confirm calibration (need 1+)';
+}
+
+// Calibration viewport tap handler
+document.getElementById('calib-viewport').addEventListener('click',    handleCalibTap);
+document.getElementById('calib-viewport').addEventListener('touchend', e => { e.preventDefault(); handleCalibTap(e); });
+
+function handleCalibTap(e) {
+  if (allCalibTapped()) return;
+  const cx = e.touches ? e.changedTouches[0].clientX : e.clientX;
+  const cy = e.touches ? e.changedTouches[0].clientY : e.clientY;
+  const [x, y] = mapTap(cx, cy, 'calib-viewport', 'calib-video');
+  const next   = nextCalibCorner();
+  if (!next) return;
+  calibTapped[next] = [x, y];
+  updateCalibChecklist();
+  updateCalibPrompt();
+  drawCalibOverlay();
+  updateCalibButtons();
+  document.getElementById('calib-err').style.display = 'none';
+}
+
+function resetCalibTaps() {
+  calibTapped = {};
+  updateCalibChecklist();
+  updateCalibPrompt();
+  clearCanvas(document.getElementById('calib-canvas'));
+  updateCalibButtons();
+  document.getElementById('calib-err').style.display = 'none';
+}
+
+function drawCalibOverlay() {
+  const canvas = document.getElementById('calib-canvas');
+  const v      = document.getElementById('calib-video');
+  canvas.width  = v.videoWidth  || 1280;
+  canvas.height = v.videoHeight || 720;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const pts = CALIB_ORDER.map(k => calibTapped[k]).filter(Boolean);
+
+  // Draw polygon outline if we have 2+ points
+  if (pts.length >= 2) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.setLineDash([5, 5]);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(...pts[0]);
+    pts.slice(1).forEach(p => ctx.lineTo(...p));
+    if (pts.length === 4) ctx.closePath();
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Draw each tapped corner
+  CALIB_ORDER.forEach(key => {
+    if (!calibTapped[key]) return;
+    const [x, y] = calibTapped[key];
+    const col = CALIB_CORNERS[key].color;
+    ctx.strokeStyle = col;
+    ctx.fillStyle   = col;
+    ctx.lineWidth   = 2.5;
+    ctx.beginPath(); ctx.arc(x, y, 12, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x, y, 3,  0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x-18, y); ctx.lineTo(x+18, y);
+    ctx.moveTo(x, y-18); ctx.lineTo(x, y+18);
+    ctx.stroke();
+    ctx.font = 'bold 11px monospace';
+    ctx.fillText(CALIB_CORNERS[key].label, x + 15, y - 8);
+  });
+}
+
+async function submitCalibFrame() {
+  if (!allCalibTapped()) return;
+  const btn = document.getElementById('calib-submit-btn');
+  btn.disabled    = true;
+  btn.textContent = 'Processing…';
+  document.getElementById('calib-err').style.display = 'none';
+
+  try {
+    const intr = getCameraIntrinsics('calib-video');
+    const blob = await captureBlob('calib-video');
+
+    // Send corners in order: TL, TR, BR, BL
+    const corners = CALIB_ORDER.map(k => calibTapped[k]);
+
+    const fd = new FormData();
+    fd.append('image',   blob, 'frame.jpg');
+    fd.append('corners', JSON.stringify(corners));
+    fd.append('fx',      intr.fx);
+    fd.append('cx',      intr.cx);
+    fd.append('cy',      intr.cy);
+    fd.append('img_w',   intr.img_w);
+    fd.append('img_h',   intr.img_h);
+
+    const res  = await fetch(API_BASE + '/calibrate_card', { method: 'POST', body: fd });
+    const data = await res.json();
+
+    if (data.error) throw new Error(data.error);
+
+    if (data.status === 'rejected') {
+      const errEl = document.getElementById('calib-err');
+      errEl.textContent    = 'Rejected: ' + data.reason;
+      errEl.style.display  = 'block';
+      btn.disabled    = false;
+      btn.textContent = 'Retry Frame';
+      return;
+    }
+
+    // Accepted
+    calFrames = data.count;
+    const pct  = Math.min(100, (calFrames / 5) * 100);
+    const fill = document.getElementById('cal-prog');
+    fill.style.width      = pct + '%';
+    fill.style.background = calFrames >= 5 ? 'var(--teal)' : 'var(--yellow)';
+    document.getElementById('cal-count').textContent = calFrames + ' / 5 frames';
+
+    const reproj = data.reproj_error;
+    const color  = reproj < 4 ? 'var(--teal)' : reproj < 8 ? 'var(--yellow)' : 'var(--danger)';
+    document.getElementById('cal-reproj').innerHTML = `<span style="color:${color}">reproj ${reproj.toFixed(1)}px</span>`;
+
+    if (data.cam_height_cm) {
+      const badge = document.getElementById('cam-badge');
+      badge.textContent = `CAM: ${data.cam_height_cm.toFixed(1)}cm`;
+      badge.classList.add('show');
+    }
+
+    document.getElementById('calib-status').textContent =
+      `Frame ${calFrames} accepted (reproj ${reproj.toFixed(1)}px) — move phone slightly and retap`;
+
+    if (data.locked) {
+      document.getElementById('calib-status').textContent = 'Calibrated! ✓';
+      setTimeout(() => { initBoxTapScreen('front'); showScreen('tap-screen'); }, 600);
+      return;
+    }
+
+    // Reset taps for next frame
+    resetCalibTaps();
+
+  } catch(e) {
+    const errEl = document.getElementById('calib-err');
+    errEl.textContent   = e.message;
+    errEl.style.display = 'block';
+    btn.disabled    = false;
+    btn.textContent = 'Retry Frame';
+  }
+}
+
+async function confirmCalibration() {
+  const btn = document.getElementById('calib-confirm-btn');
+  btn.disabled    = true;
+  btn.textContent = 'Finalising…';
+  try {
+    const intr = getCameraIntrinsics('calib-video');
+    const fd   = new FormData();
+    fd.append('fx',    intr.fx);
+    fd.append('cx',    intr.cx);
+    fd.append('cy',    intr.cy);
+    fd.append('img_w', intr.img_w);
+    fd.append('img_h', intr.img_h);
+    const res  = await fetch(API_BASE + '/confirm_calibration', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    if (data.cam_height_cm) {
+      const badge = document.getElementById('cam-badge');
+      badge.textContent = `CAM: ${data.cam_height_cm.toFixed(1)}cm`;
+      badge.classList.add('show');
+    }
+    initBoxTapScreen('front');
+    showScreen('tap-screen');
+  } catch(e) {
+    document.getElementById('calib-err').textContent   = 'Confirm failed: ' + e.message;
+    document.getElementById('calib-err').style.display = 'block';
+    btn.disabled    = false;
+    btn.textContent = 'Retry Confirm';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BOX TAP SCREEN
+// ─────────────────────────────────────────────────────────────────────────────
+function initBoxTapScreen(face) {
+  currentFace = face;
+  boxTapped   = {};
+  document.getElementById('face-title').textContent    = face === 'front' ? '① Front Face' : '② Side Face';
+  document.getElementById('face-subtitle').textContent = face === 'front' ? 'FACING YOU DIRECTLY' : 'AFTER ROTATING BOX 90°';
+  document.getElementById('tap-err').style.display     = 'none';
+  renderBoxChecklist();
+  updateBoxPrompt();
+  clearCanvas(document.getElementById('tap-overlay'));
+  updateBoxButtons();
+}
+
+function renderBoxChecklist() {
+  const el = document.getElementById('checklist');
+  el.innerHTML = '';
+  BOX_ORDER.forEach(key => {
+    const c   = BOX_CORNERS[key];
+    const div = document.createElement('div');
+    div.className = 'check-item';
+    div.id        = 'bi-' + key;
+    div.innerHTML = `
+      <div class="check-dot" id="bd-${key}" style="border-color:${c.color}"></div>
+      <div>
+        <div class="check-name" id="bn-${key}" style="color:var(--muted)">${c.label}</div>
+        <div class="check-hint">${c.hint}</div>
+      </div>`;
+    el.appendChild(div);
+  });
+}
+
+function updateBoxChecklist() {
+  BOX_ORDER.forEach(key => {
+    const done   = !!boxTapped[key];
+    const active = nextBoxCorner() === key;
+    const c      = BOX_CORNERS[key];
+    document.getElementById('bd-' + key).style.background  = done ? c.color : 'transparent';
+    document.getElementById('bd-' + key).style.borderColor = done || active ? c.color : 'var(--border)';
+    document.getElementById('bd-' + key).textContent       = done ? '✓' : '';
+    document.getElementById('bn-' + key).style.color       = done ? c.color : active ? 'var(--text)' : 'var(--muted)';
+    document.getElementById('bi-' + key).style.borderColor = done ? c.color+'60' : active ? c.color+'40' : 'var(--border)';
+    document.getElementById('bi-' + key).style.background  = done ? c.color+'12' : 'transparent';
+  });
+}
+
+function nextBoxCorner() { return BOX_ORDER.find(k => !boxTapped[k]) || null; }
+function allBoxTapped()  { return BOX_ORDER.every(k => !!boxTapped[k]); }
+
+function updateBoxPrompt() {
+  const next   = nextBoxCorner();
+  const prompt = document.getElementById('tap-prompt');
+  const banner = document.getElementById('all-tapped-banner');
+  if (allBoxTapped()) {
+    prompt.style.display = 'none';
+    banner.style.display = 'block';
+  } else if (next) {
+    prompt.style.display = 'block';
+    banner.style.display = 'none';
+    const c = BOX_CORNERS[next];
+    prompt.style.borderColor = c.color;
+    prompt.style.background  = c.color + '18';
+    document.getElementById('tap-prompt-title').textContent = 'TAP → ' + c.label.toUpperCase();
+    document.getElementById('tap-prompt-title').style.color = c.color;
+    document.getElementById('tap-prompt-hint').textContent  = c.hint;
+  }
+}
+
+function updateBoxButtons() {
+  const n   = Object.keys(boxTapped).length;
+  const btn = document.getElementById('measure-btn');
+  btn.disabled    = !allBoxTapped();
+  btn.textContent = allBoxTapped() ? 'Measure →' : n + '/3 tapped';
+  document.getElementById('reset-taps-btn').style.display = n > 0 ? 'block' : 'none';
+}
+
+document.getElementById('tap-viewport').addEventListener('click',    handleBoxTap);
+document.getElementById('tap-viewport').addEventListener('touchend', e => { e.preventDefault(); handleBoxTap(e); });
+
+function handleBoxTap(e) {
+  if (allBoxTapped()) return;
+  const cx = e.touches ? e.changedTouches[0].clientX : e.clientX;
+  const cy = e.touches ? e.changedTouches[0].clientY : e.clientY;
+  const [x, y] = mapTap(cx, cy, 'tap-viewport', 'tap-video');
+  const next   = nextBoxCorner();
+  if (!next) return;
+  boxTapped[next] = [x, y];
+  document.getElementById('tap-err').style.display = 'none';
+  updateBoxChecklist();
+  updateBoxPrompt();
+  drawBoxOverlay();
+  updateBoxButtons();
+}
+
+function resetBoxTaps() {
+  boxTapped = {};
+  updateBoxChecklist();
+  updateBoxPrompt();
+  clearCanvas(document.getElementById('tap-overlay'));
+  updateBoxButtons();
+  document.getElementById('tap-err').style.display = 'none';
+}
+
+function tapBack() {
+  if (currentFace === 'front') {
+    initCalibScreen();
+    showScreen('calib-screen');
+  } else {
+    showScreen('turn-screen');
+  }
+}
+
+function redoFrontFace() {
+  initBoxTapScreen('front');
+  showScreen('tap-screen');
+}
+
+function drawBoxOverlay() {
+  const canvas = document.getElementById('tap-overlay');
+  const v      = document.getElementById('tap-video');
+  canvas.width  = v.videoWidth  || 1280;
+  canvas.height = v.videoHeight || 720;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  Object.entries(boxTapped).forEach(([key, [x, y]]) => {
+    const col = BOX_CORNERS[key].color;
+    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(x, y, 14, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x, y, 3,  0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x-20, y); ctx.lineTo(x+20, y);
+    ctx.moveTo(x, y-20); ctx.lineTo(x, y+20);
+    ctx.stroke();
+    ctx.font = 'bold 12px monospace';
+    ctx.fillText(BOX_CORNERS[key].label, x + 16, y - 8);
+  });
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.setLineDash([5, 5]); ctx.lineWidth = 1;
+  if (boxTapped.bl && boxTapped.br) {
+    ctx.beginPath(); ctx.moveTo(...boxTapped.bl); ctx.lineTo(...boxTapped.br); ctx.stroke();
+  }
+  if (boxTapped.bl && boxTapped.tl) {
+    ctx.beginPath(); ctx.moveTo(...boxTapped.bl); ctx.lineTo(...boxTapped.tl); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+}
+
+async function submitFace() {
+  if (!allBoxTapped()) return;
+  const btn = document.getElementById('measure-btn');
+  btn.disabled = true; btn.textContent = 'Measuring…';
+
+  try {
+    const intr = getCameraIntrinsics('tap-video');
+    const body = JSON.stringify({
+      corners: { bl: boxTapped.bl, br: boxTapped.br, tl: boxTapped.tl },
+      fx: intr.fx, cx: intr.cx, cy: intr.cy,
+      img_w: intr.img_w, img_h: intr.img_h,
+      face: currentFace,
+    });
+    const res  = await fetch(API_BASE + '/measure_face', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    console.log(`[measure] ${currentFace}: ${(data.width_m*100).toFixed(1)}cm × ${(data.height_m*100).toFixed(1)}cm  res=${data.residual_mm}mm  camH=${(data.cam_height_m*100).toFixed(1)}cm`);
+
+    if (currentFace === 'front') {
+      face1 = data;
+      document.getElementById('turn-dims').textContent    = cm(face1.width_m) + ' × ' + cm(face1.height_m) + ' cm';
+      document.getElementById('turn-residual').textContent = 'residual ' + (face1.residual_mm||0).toFixed(1) + 'mm';
+      showScreen('turn-screen');
+    } else {
+      face2 = data;
+      await computeVolume();
+    }
+  } catch(e) {
+    const el = document.getElementById('tap-err');
+    el.textContent = e.message; el.style.display = 'block';
+    btn.disabled = false; btn.textContent = 'Measure →';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIDE FACE
+// ─────────────────────────────────────────────────────────────────────────────
+function startSideFace() {
+  initBoxTapScreen('side');
+  showScreen('tap-screen');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VOLUME
+// ─────────────────────────────────────────────────────────────────────────────
+async function computeVolume() {
+  try {
+    const res  = await fetch(API_BASE + '/compute_volume', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ face1, face2 }),
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    showResult(data);
+  } catch(e) {
+    const el = document.getElementById('tap-err');
+    el.textContent = 'Volume: ' + e.message; el.style.display = 'block';
+    document.getElementById('measure-btn').disabled = false;
+    document.getElementById('measure-btn').textContent = 'Retry';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RESULT
+// ─────────────────────────────────────────────────────────────────────────────
+function showResult(data) {
+  // ── Main dimension cards ──────────────────────────────────────────────────
+  document.getElementById('res-l').textContent   = cm(data.length_m);
+  document.getElementById('res-w').textContent   = cm(data.width_m);
+  document.getElementById('res-h').textContent   = cm(data.height_m);
+  document.getElementById('res-vol').textContent = vol(data.volume_m3);
+
+  // ── Quality badges ────────────────────────────────────────────────────────
+  const consist   = data.height_consistency_mm ?? 999;
+  const qualityOk = consist < 15;
+  const badge     = document.getElementById('quality-badge');
+  badge.textContent       = qualityOk ? 'HIGH ACCURACY' : 'REVIEW';
+  badge.style.color       = qualityOk ? 'var(--teal)' : 'var(--yellow)';
+  badge.style.borderColor = qualityOk ? 'var(--teal)' : 'var(--yellow)';
+
+  setQB('qb-consist', 'HEIGHT CONSISTENCY',
+    consist < 900 ? consist.toFixed(1) + 'mm' : '—', consist < 15);
+  setQB('qb-r1', 'FACE 1 RESIDUAL',
+    ((data.face1_residual_mm) || 0).toFixed(1) + 'mm', (data.face1_residual_mm || 99) < 8);
+  setQB('qb-r2', 'FACE 2 RESIDUAL',
+    ((data.face2_residual_mm) || 0).toFixed(1) + 'mm', (data.face2_residual_mm || 99) < 8);
+
+  // ── Per-face breakdown ────────────────────────────────────────────────────
+  // Show each face's raw width × height (before fusion)
+  if (face1) document.getElementById('res-f1').textContent =
+    cm(face1.width_m) + ' × ' + cm(face1.height_m) + ' cm';
+  if (face2) document.getElementById('res-f2').textContent =
+    cm(face2.width_m) + ' × ' + cm(face2.height_m) + ' cm';
+
+  // Camera height from whichever face has it
+  const camH = (face1 && face1.cam_height_m) || (face2 && face2.cam_height_m);
+  if (camH) document.getElementById('res-camh').textContent = (camH * 100).toFixed(1) + ' cm';
+
+  // ── Warning banner ────────────────────────────────────────────────────────
+  const w = document.getElementById('result-warn');
+  if (!qualityOk) {
+    w.textContent   = '⚠ Height inconsistency ' + consist.toFixed(0) + 'mm — retap corners more precisely';
+    w.style.display = 'block';
+  } else {
+    w.style.display = 'none';
+  }
+
+  showScreen('result-screen');
+}
+
+function setQB(id, label, val, good) {
+  const el = document.getElementById(id);
+  el.style.borderColor = good ? '#1e3a2a' : '#3a2a1a';
+  el.innerHTML = `<div class="qual-badge-label">${label}</div><div class="qual-badge-val" style="color:${good?'var(--teal)':'var(--yellow)'}">${val}</div>`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RESET
+// ─────────────────────────────────────────────────────────────────────────────
+function rescan() {
+  face1 = null; face2 = null;
+  initBoxTapScreen('front');
+  showScreen('tap-screen');
+}
+
+async function resetAll() {
+  await fetch(API_BASE + '/reset_calibration', { method: 'POST' }).catch(() => {});
+  face1 = null; face2 = null; calFrames = 0;
+  document.getElementById('cal-prog').style.width  = '0';
+  document.getElementById('cal-count').textContent = '0 / 5 frames';
+  document.getElementById('cal-reproj').innerHTML  = '';
+  document.getElementById('cam-badge').classList.remove('show');
+  document.getElementById('calib-err').style.display = 'none';
+  initCalibScreen();
+  showScreen('calib-screen');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+function clearCanvas(c) { if (c) c.getContext('2d').clearRect(0, 0, c.width, c.height); }
+function cm(m)  { return m == null ? '—' : (m * 100).toFixed(1); }
+function vol(v) { return v == null ? '—' : (v * 1e6).toFixed(0); }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BOOT
+// ─────────────────────────────────────────────────────────────────────────────
+initCamera();
+</script>
+</body>
+</html>

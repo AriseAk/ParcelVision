@@ -1,0 +1,108 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+pip-wheel-metadata/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Flask
+instance/
+.webassets-cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# =========================
+# Environment variables
+# =========================
+.env
+.env.*
+*.env
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# Model files (IGNORE ALL)
+# =========================
+*.pth
+*.pt
+*.onnx
+*.h5
+*.ckpt
+*.weights
+*.pb
+*.tflite
+*.bin
+*.joblib
+*.pkl
+*.pickle
+*.safetensors
+
+# Model folders
+models/
+weights/
+checkpoints/
+
+# =========================
+# Node / Next.js
+# =========================
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-lock.yaml
+
+# Build outputs
+dist/
+coverage/
+
+# =========================
+# VS Code
+# =========================
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# =========================
+# Uploads / generated files
+# =========================
+uploads/
+temp/
+tmp/
+cache/
+
+# =========================
+# Ignore compiled binaries
+# =========================
+*.exe
+*.dll
+*.o
+*.a
+*.class
+
+# =========================
+# Optional large datasets
+# =========================
+data/
+datasets/
