@@ -1,0 +1,37 @@
+# ParcelVision Stage 7 — Metric Depth Pipeline
+# Install: pip install -r requirements.txt
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# ── ZoeDepth dependencies ─────────────────────────────────────────────────────
+timm>=0.6.13          # Vision Transformer backbones used by ZoeDepth
+einops>=0.6.0         # Tensor rearrangement (required by ZoeDepth internals)
+huggingface_hub       # Model weight download
+
+# ── Computer Vision ───────────────────────────────────────────────────────────
+opencv-python>=4.7.0
+numpy>=1.23.0
+Pillow>=9.0.0
+
+# ── Detection + Segmentation ──────────────────────────────────────────────────
+ultralytics>=8.0.0    # YOLO World
+segment-anything      # SAM  (pip install git+https://github.com/facebookresearch/segment-anything.git)
+
+# ── Server ────────────────────────────────────────────────────────────────────
+flask>=2.3.0
+flask-cors>=4.0.0
+
+# ── Visualisation (optional, for zoedepth_runner.py CLI test) ────────────────
+matplotlib>=3.7.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTE: ZoeDepth itself is loaded via torch.hub, NOT pip-installed.
+#       No extra install needed — torch.hub.load("isl-org/ZoeDepth", ...)
+#       downloads weights automatically on first call.
+#
+# SAM checkpoint:  wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
+# YOLO World:      auto-downloaded by ultralytics on first use
+# ─────────────────────────────────────────────────────────────────────────────
