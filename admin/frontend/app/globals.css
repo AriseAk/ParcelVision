@@ -1,0 +1,157 @@
+@import "tailwindcss";
+
+/* =========================================================================
+   ParcelVision Admin — Global Styles & Design Tokens
+   ========================================================================= */
+
+/* --- Color palette (dark admin theme) --- */
+@theme inline {
+  --color-bg-primary: #0b0e14;
+  --color-bg-secondary: #111827;
+  --color-bg-card: #1a1f2e;
+  --color-bg-hover: #232a3b;
+  --color-bg-input: #1e2536;
+  --color-border: #2a3040;
+  --color-border-focus: #6366f1;
+  --color-text-primary: #f1f5f9;
+  --color-text-secondary: #94a3b8;
+  --color-text-muted: #64748b;
+  --color-accent: #6366f1;
+  --color-accent-hover: #818cf8;
+  --color-accent-glow: rgba(99, 102, 241, 0.25);
+  --color-success: #22c55e;
+  --color-warning: #f59e0b;
+  --color-danger: #ef4444;
+  --color-danger-hover: #dc2626;
+}
+
+/* --- Base styles --- */
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* --- Scrollbar styling --- */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+/* --- Glassmorphism card --- */
+.glass-card {
+  background: rgba(26, 31, 46, 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(42, 48, 64, 0.6);
+  border-radius: 12px;
+}
+
+/* --- Glow effect for focused inputs --- */
+.input-glow:focus {
+  box-shadow: 0 0 0 3px var(--color-accent-glow);
+}
+
+/* --- Smooth page transitions --- */
+.page-enter {
+  animation: fadeSlideIn 0.3s ease-out forwards;
+}
+
+@keyframes fadeSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* --- Table row hover glow --- */
+.table-row-hover {
+  transition: background-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.table-row-hover:hover {
+  background-color: var(--color-bg-hover);
+  box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.15);
+}
+
+/* --- Button base --- */
+.btn-primary {
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+  transition: all 0.2s ease;
+}
+
+.btn-primary:hover {
+  background: linear-gradient(135deg, #818cf8 0%, #a78bfa 100%);
+  box-shadow: 0 4px 15px rgba(99, 102, 241, 0.4);
+  transform: translateY(-1px);
+}
+
+.btn-primary:active {
+  transform: translateY(0);
+}
+
+.btn-danger {
+  background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+  transition: all 0.2s ease;
+}
+
+.btn-danger:hover {
+  background: linear-gradient(135deg, #f87171 0%, #ef4444 100%);
+  box-shadow: 0 4px 15px rgba(239, 68, 68, 0.4);
+}
+
+/* --- Sidebar link --- */
+.sidebar-link {
+  transition: all 0.2s ease;
+  border-left: 3px solid transparent;
+}
+
+.sidebar-link:hover {
+  background-color: rgba(99, 102, 241, 0.08);
+  border-left-color: rgba(99, 102, 241, 0.4);
+}
+
+.sidebar-link.active {
+  background-color: rgba(99, 102, 241, 0.12);
+  border-left-color: #6366f1;
+  color: #818cf8;
+}
+
+/* --- Loading spinner --- */
+.spinner {
+  border: 3px solid var(--color-border);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  width: 24px;
+  height: 24px;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
