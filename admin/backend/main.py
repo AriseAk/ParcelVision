@@ -48,8 +48,10 @@ mongo_client = MongoClient(MONGO_URI)
 db = mongo_client[DB_NAME]
 
 # Collections
-users_col      = db["users"]
-rate_plans_col = db["rate_plans"]
+users_col        = db["users"]
+rate_plans_col   = db["rate_plans"]
+shipments_col    = db["shipments"]
+transactions_col = db["transactions"]
 
 # Ensure unique email index
 users_col.create_index("email", unique=True)
@@ -440,7 +442,347 @@ def delete_rate(rate_id):
 
 
 # ---------------------------------------------------------------------------
-# 9. HEALTH CHECK
+# 9. SHIPMENTS ROUTES — /api/shipments
+# ---------------------------------------------------------------------------
+VALID_STATUSES = ["pending", "picked_up", "in_transit", "out_for_delivery", "delivered", "cancelled", "returned"]
+
+
+def validate_shipment(data):
+    """Validate shipment fields. Returns (clean_data, error_message)."""
+    required = ["tracking_number", "sender_name", "sender_address",
+                 "receiver_name", "receiver_address", "origin", "destination",
+                 "carrier", "weight"]
+
+    for field in required:
+        if field not in data or data[field] is None or str(data[field]).strip() == "":
+            return None, f"Missing required field: {field}"
+
+    if data.get("carrier") and data["carrier"] not in VALID_CARRIERS:
+        return None, f"Invalid carrier. Must be one of: {VALID_CARRIERS}"
+
+    status = data.get("status", "pending")
+    if status not in VALID_STATUSES:
+        return None, f"Invalid status. Must be one of: {VALID_STATUSES}"
+
+    try:
+        weight = float(data["weight"])
+        if weight <= 0:
+            return None, "Weight must be positive"
+    except (ValueError, TypeError):
+        return None, "Weight must be a valid number"
+
+    clean_data = {
+        "tracking_number":  str(data["tracking_number"]).strip(),
+        "sender_name":      str(data["sender_name"]).strip(),
+        "sender_address":   str(data["sender_address"]).strip(),
+        "receiver_name":    str(data["receiver_name"]).strip(),
+        "receiver_address": str(data["receiver_address"]).strip(),
+        "origin":           str(data["origin"]).strip(),
+        "destination":      str(data["destination"]).strip(),
+        "carrier":          data["carrier"],
+        "weight":           weight,
+        "unit":             data.get("unit", "KG"),
+        "status":           status,
+        "notes":            str(data.get("notes", "")).strip(),
+    }
+
+    return clean_data, None
+
+
+@app.route("/api/shipments", methods=["GET"])
+@token_required
+def get_shipments():
+    """List all shipments with optional filters."""
+    query = {}
+    for field in ["carrier", "status", "origin", "destination"]:
+        value = request.args.get(field)
+        if value:
+            query[field] = value
+
+    search = request.args.get("search")
+    if search:
+        query["$or"] = [
+            {"tracking_number": {"$regex": search, "$options": "i"}},
+            {"sender_name":     {"$regex": search, "$options": "i"}},
+            {"receiver_name":   {"$regex": search, "$options": "i"}},
+        ]
+
+    shipments = serialize_list(shipments_col.find(query).sort("created_at", -1))
+    return jsonify({"shipments": shipments, "count": len(shipments)}), 200
+
+
+@app.route("/api/shipments", methods=["POST"])
+@token_required
+def create_shipment():
+    """Create a new shipment."""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    clean_data, error = validate_shipment(data)
+    if error:
+        return jsonify({"error": error}), 400
+
+    now = datetime.datetime.utcnow()
+    clean_data["created_at"] = now
+    clean_data["updated_at"] = now
+    clean_data["created_by"] = g.current_user["user_id"]
+
+    result = shipments_col.insert_one(clean_data)
+    clean_data["_id"] = str(result.inserted_id)
+
+    return jsonify({"message": "Shipment created", "shipment": clean_data}), 201
+
+
+@app.route("/api/shipments/<shipment_id>", methods=["PUT"])
+@token_required
+def update_shipment(shipment_id):
+    """Update an existing shipment."""
+    try:
+        oid = ObjectId(shipment_id)
+    except bson_errors.InvalidId:
+        return jsonify({"error": "Invalid shipment ID"}), 400
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    clean_data, error = validate_shipment(data)
+    if error:
+        return jsonify({"error": error}), 400
+
+    clean_data["updated_at"] = datetime.datetime.utcnow()
+    result = shipments_col.update_one({"_id": oid}, {"$set": clean_data})
+    if result.matched_count == 0:
+        return jsonify({"error": "Shipment not found"}), 404
+
+    updated = serialize_doc(shipments_col.find_one({"_id": oid}))
+    return jsonify({"message": "Shipment updated", "shipment": updated}), 200
+
+
+@app.route("/api/shipments/<shipment_id>", methods=["DELETE"])
+@token_required
+def delete_shipment(shipment_id):
+    """Delete a shipment."""
+    try:
+        oid = ObjectId(shipment_id)
+    except bson_errors.InvalidId:
+        return jsonify({"error": "Invalid shipment ID"}), 400
+
+    result = shipments_col.delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        return jsonify({"error": "Shipment not found"}), 404
+
+    return jsonify({"message": "Shipment deleted"}), 200
+
+
+# ---------------------------------------------------------------------------
+# 10. USERS ROUTES — /api/users
+# ---------------------------------------------------------------------------
+@app.route("/api/users", methods=["GET"])
+@token_required
+def get_users():
+    """List all registered users (admin only). Password hashes are excluded."""
+    search = request.args.get("search")
+    query = {}
+    if search:
+        query["email"] = {"$regex": search, "$options": "i"}
+
+    role_filter = request.args.get("role")
+    if role_filter:
+        query["role"] = role_filter
+
+    users = list(users_col.find(query, {"password_hash": 0}).sort("created_at", -1))
+    serialized = serialize_list(users)
+    return jsonify({"users": serialized, "count": len(serialized)}), 200
+
+
+@app.route("/api/users/<user_id>", methods=["PUT"])
+@token_required
+def update_user(user_id):
+    """Update a user's role."""
+    try:
+        oid = ObjectId(user_id)
+    except bson_errors.InvalidId:
+        return jsonify({"error": "Invalid user ID"}), 400
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    update_fields = {}
+    if "role" in data and data["role"] in ["admin", "user"]:
+        update_fields["role"] = data["role"]
+
+    if not update_fields:
+        return jsonify({"error": "No valid fields to update"}), 400
+
+    result = users_col.update_one({"_id": oid}, {"$set": update_fields})
+    if result.matched_count == 0:
+        return jsonify({"error": "User not found"}), 404
+
+    updated = serialize_doc(users_col.find_one({"_id": oid}, {"password_hash": 0}))
+    return jsonify({"message": "User updated", "user": updated}), 200
+
+
+@app.route("/api/users/<user_id>", methods=["DELETE"])
+@token_required
+def delete_user(user_id):
+    """Delete a user."""
+    try:
+        oid = ObjectId(user_id)
+    except bson_errors.InvalidId:
+        return jsonify({"error": "Invalid user ID"}), 400
+
+    # Prevent self-deletion
+    if str(oid) == g.current_user.get("user_id"):
+        return jsonify({"error": "Cannot delete your own account"}), 400
+
+    result = users_col.delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        return jsonify({"error": "User not found"}), 404
+
+    return jsonify({"message": "User deleted"}), 200
+
+
+# ---------------------------------------------------------------------------
+# 11. TRANSACTIONS ROUTES — /api/transactions
+# ---------------------------------------------------------------------------
+VALID_PAYMENT_METHODS = ["credit_card", "debit_card", "paypal", "bank_transfer", "cash", "upi"]
+VALID_TXN_STATUSES    = ["pending", "completed", "failed", "refunded"]
+
+
+def validate_transaction(data):
+    """Validate transaction fields. Returns (clean_data, error_message)."""
+    required = ["shipment_id", "amount", "currency", "payment_method"]
+
+    for field in required:
+        if field not in data or data[field] is None or str(data[field]).strip() == "":
+            return None, f"Missing required field: {field}"
+
+    try:
+        amount = float(data["amount"])
+        if amount <= 0:
+            return None, "Amount must be positive"
+    except (ValueError, TypeError):
+        return None, "Amount must be a valid number"
+
+    if data["currency"] not in VALID_CURRENCIES:
+        return None, f"Invalid currency. Must be one of: {VALID_CURRENCIES}"
+
+    if data["payment_method"] not in VALID_PAYMENT_METHODS:
+        return None, f"Invalid payment method. Must be one of: {VALID_PAYMENT_METHODS}"
+
+    status = data.get("status", "pending")
+    if status not in VALID_TXN_STATUSES:
+        return None, f"Invalid status. Must be one of: {VALID_TXN_STATUSES}"
+
+    clean_data = {
+        "shipment_id":    str(data["shipment_id"]).strip(),
+        "amount":         amount,
+        "currency":       data["currency"],
+        "payment_method": data["payment_method"],
+        "status":         status,
+        "description":    str(data.get("description", "")).strip(),
+    }
+
+    return clean_data, None
+
+
+@app.route("/api/transactions", methods=["GET"])
+@token_required
+def get_transactions():
+    """List all transactions with optional filters."""
+    query = {}
+
+    for field in ["status", "payment_method", "currency"]:
+        value = request.args.get(field)
+        if value:
+            query[field] = value
+
+    search = request.args.get("search")
+    if search:
+        query["$or"] = [
+            {"shipment_id":  {"$regex": search, "$options": "i"}},
+            {"description":  {"$regex": search, "$options": "i"}},
+        ]
+
+    transactions = serialize_list(transactions_col.find(query).sort("created_at", -1))
+    return jsonify({"transactions": transactions, "count": len(transactions)}), 200
+
+
+@app.route("/api/transactions", methods=["POST"])
+@token_required
+def create_transaction():
+    """Create a new transaction."""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    clean_data, error = validate_transaction(data)
+    if error:
+        return jsonify({"error": error}), 400
+
+    now = datetime.datetime.utcnow()
+    clean_data["created_at"] = now
+    clean_data["updated_at"] = now
+    clean_data["created_by"] = g.current_user["user_id"]
+
+    result = transactions_col.insert_one(clean_data)
+    clean_data["_id"] = str(result.inserted_id)
+
+    return jsonify({"message": "Transaction created", "transaction": clean_data}), 201
+
+
+@app.route("/api/transactions/<txn_id>", methods=["PUT"])
+@token_required
+def update_transaction(txn_id):
+    """Update a transaction's status."""
+    try:
+        oid = ObjectId(txn_id)
+    except bson_errors.InvalidId:
+        return jsonify({"error": "Invalid transaction ID"}), 400
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    update_fields = {}
+    if "status" in data:
+        if data["status"] not in VALID_TXN_STATUSES:
+            return jsonify({"error": f"Invalid status. Must be one of: {VALID_TXN_STATUSES}"}), 400
+        update_fields["status"] = data["status"]
+
+    if not update_fields:
+        return jsonify({"error": "No valid fields to update"}), 400
+
+    update_fields["updated_at"] = datetime.datetime.utcnow()
+    result = transactions_col.update_one({"_id": oid}, {"$set": update_fields})
+    if result.matched_count == 0:
+        return jsonify({"error": "Transaction not found"}), 404
+
+    updated = serialize_doc(transactions_col.find_one({"_id": oid}))
+    return jsonify({"message": "Transaction updated", "transaction": updated}), 200
+
+
+@app.route("/api/transactions/<txn_id>", methods=["DELETE"])
+@token_required
+def delete_transaction(txn_id):
+    """Delete a transaction."""
+    try:
+        oid = ObjectId(txn_id)
+    except bson_errors.InvalidId:
+        return jsonify({"error": "Invalid transaction ID"}), 400
+
+    result = transactions_col.delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        return jsonify({"error": "Transaction not found"}), 404
+
+    return jsonify({"message": "Transaction deleted"}), 200
+
+
+# ---------------------------------------------------------------------------
+# 12. HEALTH CHECK
 # ---------------------------------------------------------------------------
 @app.route("/api/health", methods=["GET"])
 def health_check():
@@ -449,7 +791,7 @@ def health_check():
 
 
 # ---------------------------------------------------------------------------
-# 10. RUN SERVER
+# 13. RUN SERVER
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     print(f"🚀 ParcelVision Admin API starting on port {FLASK_PORT}")
