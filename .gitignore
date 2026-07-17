@@ -108,3 +108,6 @@ data/
 datasets/
 
 ParcelVision_Report_Black.docx
+
+backend/
+backend/Depth-Anything-V2
