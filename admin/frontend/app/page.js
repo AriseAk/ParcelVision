@@ -59,20 +59,20 @@ export default function LoginPage() {
 
   return (
     <div className="min-h-screen flex items-center justify-center relative overflow-hidden"
-         style={{ background: "linear-gradient(135deg, #0b0e14 0%, #1a1040 50%, #0b0e14 100%)" }}>
+         style={{ background: "linear-gradient(135deg, var(--color-bg-primary) 0%, var(--color-bg-secondary) 100%)" }}>
 
       {/* Ambient glow orbs */}
-      <div className="absolute top-1/4 left-1/4 w-96 h-96 rounded-full opacity-20 blur-3xl"
-           style={{ background: "radial-gradient(circle, #6366f1 0%, transparent 70%)" }} />
-      <div className="absolute bottom-1/4 right-1/4 w-96 h-96 rounded-full opacity-15 blur-3xl"
-           style={{ background: "radial-gradient(circle, #8b5cf6 0%, transparent 70%)" }} />
+      <div className="absolute top-1/4 left-1/4 w-96 h-96 rounded-full opacity-35 blur-3xl"
+           style={{ background: "radial-gradient(circle, var(--color-accent) 0%, transparent 70%)" }} />
+      <div className="absolute bottom-1/4 right-1/4 w-96 h-96 rounded-full opacity-30 blur-3xl"
+           style={{ background: "radial-gradient(circle, var(--color-border) 0%, transparent 70%)" }} />
 
       {/* Login card */}
       <div className="glass-card p-8 w-full max-w-md mx-4 page-enter relative z-10">
         {/* Logo / Header */}
         <div className="text-center mb-8">
           <div className="inline-flex items-center justify-center w-14 h-14 rounded-xl mb-4"
-               style={{ background: "linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)" }}>
+               style={{ background: "linear-gradient(135deg, var(--color-accent) 0%, var(--color-accent-hover) 100%)" }}>
             <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
               <polyline points="3.27 6.96 12 12.01 20.73 6.96" />

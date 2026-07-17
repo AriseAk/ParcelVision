@@ -127,22 +127,22 @@ export default function Sidebar() {
           ${mobileOpen ? "translate-x-0" : "-translate-x-full"}
         `}
         style={{
-          background: "var(--color-bg-secondary)",
-          borderRight: "1px solid var(--color-border)",
+          background: "var(--color-sidebar-bg)",
+          borderRight: "1px solid var(--color-sidebar-border)",
         }}
       >
         {/* Logo area */}
-        <div className="p-5 pb-4" style={{ borderBottom: "1px solid var(--color-border)" }}>
+        <div className="p-5 pb-4" style={{ borderBottom: "1px solid var(--color-sidebar-border)" }}>
           <div className="flex items-center gap-3">
             <div className="w-9 h-9 rounded-lg flex items-center justify-center"
-                 style={{ background: "linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)" }}>
+                 style={{ background: "linear-gradient(135deg, var(--color-accent) 0%, var(--color-accent-hover) 100%)" }}>
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
               </svg>
             </div>
             <div>
-              <h2 className="text-sm font-bold" style={{ color: "var(--color-text-primary)" }}>ParcelVision</h2>
-              <p className="text-xs" style={{ color: "var(--color-text-muted)" }}>Admin Panel</p>
+              <h2 className="text-sm font-bold" style={{ color: "var(--color-sidebar-text)" }}>ParcelVision</h2>
+              <p className="text-xs" style={{ color: "var(--color-sidebar-text-muted)" }}>Admin Panel</p>
             </div>
           </div>
         </div>
@@ -157,7 +157,7 @@ export default function Sidebar() {
               className={`sidebar-link flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium no-underline ${
                 isActive(item.href) ? "active" : ""
               }`}
-              style={{ color: isActive(item.href) ? "#818cf8" : "var(--color-text-secondary)" }}
+              style={{ color: isActive(item.href) ? "#000000" : "var(--color-sidebar-text)" }}
             >
               {item.icon}
               {item.label}
@@ -166,17 +166,17 @@ export default function Sidebar() {
         </nav>
 
         {/* User section at bottom */}
-        <div className="p-4" style={{ borderTop: "1px solid var(--color-border)" }}>
+        <div className="p-4" style={{ borderTop: "1px solid var(--color-sidebar-border)" }}>
           <div className="flex items-center gap-3 mb-3">
             <div className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white"
-                 style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }}>
+                 style={{ background: "linear-gradient(135deg, var(--color-accent), var(--color-accent-hover))" }}>
               {session?.user?.email?.[0]?.toUpperCase() || "A"}
             </div>
             <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium truncate" style={{ color: "var(--color-text-primary)" }}>
+              <p className="text-sm font-medium truncate" style={{ color: "var(--color-sidebar-text)" }}>
                 {session?.user?.email || "Admin"}
               </p>
-              <p className="text-xs" style={{ color: "var(--color-text-muted)" }}>
+              <p className="text-xs" style={{ color: "var(--color-sidebar-text-muted)" }}>
                 {session?.user?.role || "admin"}
               </p>
             </div>

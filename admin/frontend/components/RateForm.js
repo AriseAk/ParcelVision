@@ -166,14 +166,14 @@ export default function RateForm({ initialData, onSubmit, loading, submitLabel =
 
   // ---- Shared input styles ----
   const inputStyle = {
-    background: "var(--color-bg-input)",
-    border: "1px solid var(--color-border)",
+    background: "var(--color-bg-card)",
+    border: "1px solid rgba(99, 102, 241, 0.25)",
     color: "var(--color-text-primary)",
   };
 
   const errorInputStyle = {
     ...inputStyle,
-    borderColor: "#ef4444",
+    border: "1px solid #ef4444",
   };
 
   const labelClass = "block text-sm font-medium mb-1.5";
